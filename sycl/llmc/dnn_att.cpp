@@ -180,7 +180,7 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
 
 int main(){
 
-  auto ekind = engine::kind::gpu;
+  auto ekind = engine::kind::cpu;
         
   sycl::queue q = (ekind == engine::kind::gpu)
             ? sycl::queue(

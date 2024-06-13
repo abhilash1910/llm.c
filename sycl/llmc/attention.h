@@ -17,13 +17,6 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 typedef float floatX;
 
 //typedef sycl::ext::oneapi::bfloat16 floatX;
-#define CUBLAS_LOWP dpct::library_data_t::real_bfloat16
-#define CUBLAS_LOWP_COMPUTE dpct::library_data_t::real_float
-#define CUBLAS_COMPUTE_32F CUBLAS_LOWP_COMPUTE
-
-const size_t cublaslt_workspace_size = 32 * 1024 * 1024;
-void* cublaslt_workspace = NULL;
-dpct::library_data_t cublas_compute = CUBLAS_COMPUTE_32F;
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -420,6 +413,7 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 }
+/*
 int main(){
 
     
@@ -490,3 +484,4 @@ int main(){
   return 0;
 
 }
+*/

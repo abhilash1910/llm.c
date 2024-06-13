@@ -544,7 +544,7 @@ catch (sycl::exception const &exc) {
 }
 
 }
-
+/*
 int main(int argc, char** argv) {
     srand(0);
 
@@ -608,3 +608,4 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+*/

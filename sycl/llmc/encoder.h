@@ -301,7 +301,7 @@ catch (sycl::exception const &exc) {
 }
     
 }
-
+/*
 int main(){
 
 
@@ -345,3 +345,4 @@ int main(){
 return 0;
 
 }
+*/

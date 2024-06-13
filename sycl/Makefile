@@ -1,7 +1,7 @@
 # Compiler
 CC          := icpx
 # Flags
-CXXFLAGS      := -std=c++17 -fsycl -O3 -fno-finite-math-only -qmkl=parallel 
+CXXFLAGS    := -std=c++17 -fsycl -O3 -fno-finite-math-only -qmkl=parallel 
 OPTIMIZE    := yes
 PVC         := yes
 CUDA        := no
@@ -42,7 +42,16 @@ ifeq ($(NOWARN),yes)
 endif
 
 # Build rule for individual files
+# To build train_gpt2.cpp
+# $make train_gpt2
+
+# To build other cpp files inside llmc/
+# $make llmc/<filename>
+
 %: %.cpp
 	$(CC) $(CXXFLAGS) $< -o $@.o
+ 
+
+
 
 

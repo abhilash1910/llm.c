@@ -80,7 +80,7 @@ void adamw(Tp* params_memory, float* master_params_memory, Tg* grads_memory, flo
     q.wait();
     
    }
-
+/*
 int main(){
 
     const long num_parameters = 1048576;
@@ -151,4 +151,4 @@ int main(){
 
   return 0;
 
-}
+}*/

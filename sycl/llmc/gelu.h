@@ -97,7 +97,7 @@ void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, syc
       });
     
 }
-
+/*
 int main(){
 
 
@@ -150,3 +150,4 @@ int main(){
 
 
 }
+*/

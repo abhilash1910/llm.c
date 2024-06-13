@@ -81,7 +81,7 @@ catch (sycl::exception const &exc) {
   std::exit(1);
   }
 }
-  
+/*  
 int main(int argc, char** argv) {
     int C = 768;
     int L = 12;
@@ -116,5 +116,5 @@ int main(int argc, char** argv) {
     return 0;
 }
    
-
+*/
 

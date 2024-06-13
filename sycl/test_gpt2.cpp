@@ -2,8 +2,12 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
-#include "train_gpt2.dp.cpp"
+#include "train_gpt2.cpp"
 #include <cmath>
+#pragma once
+#include <oneapi/dnnl/dnnl_graph.hpp>
+#include <oneapi/dnnl/dnnl_graph_sycl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
 
 // poor man's tensor checker
 int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-0) {
@@ -93,9 +97,18 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
-    common_start(false, true);
+    auto ekind = engine::kind::gpu;
+        
+    sycl::queue q = (ekind == engine::kind::gpu)
+            ? sycl::queue(
+                    sycl::gpu_selector_v, sycl::property::queue::in_order {})
+            : sycl::queue(
+                    sycl::cpu_selector_v, sycl::property::queue::in_order {});
 
+    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    common_start(false, true, q);
+
+    
     // set the right paths
     #if defined(ENABLE_BF16)
     const char* load_filename = "gpt2_124M_bf16.bin";
@@ -106,7 +119,7 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model from a checkpoint
     GPT2 model;
 
-    gpt2_build_from_checkpoint(&model, load_filename);
+    gpt2_build_from_checkpoint(&model, load_filename, q);
     size_t V = model.config.vocab_size;
     size_t Vp = model.config.padded_vocab_size;
     size_t maxT = model.config.max_seq_len;
@@ -157,13 +170,12 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     // First, do target-free forward pass to validate logits
-    gpt2_forward(&model, x, NULL, B, T);
+    gpt2_forward(&model, x, NULL, B, T, 1, q, ekind);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    dpct::get_in_order_queue()
-        .memcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX))
+    q.memcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX))
         .wait();
     for (int i = 0; i < B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
@@ -207,9 +219,9 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        gpt2_forward(&model, x, y, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model, x);
+        gpt2_forward(&model, x, y, B, T, 1, q, ekind);
+        gpt2_zero_grad(&model, q);
+        gpt2_backward(&model, x, q);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -225,8 +237,7 @@ int main(int argc, char *argv[]) {
             }
 
             // move the (mixed precision) grads from GPU to CPU
-            dpct::get_in_order_queue()
-                .memcpy(grads_memory_cpu, model.grads_memory,
+            q.memcpy(grads_memory_cpu, model.grads_memory,
                         model.num_parameters_bytes)
                 .wait();
 
@@ -283,7 +294,7 @@ int main(int argc, char *argv[]) {
             allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 2e-2f);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config, q);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
@@ -318,16 +329,16 @@ int main(int argc, char *argv[]) {
     printf("overall okay: %d\n", allok);
 
     // free everything
-    gpt2_free(&model);
-    common_free(model);
-    free(x);
-    free(y);
-    free(logits_cpu_raw);
-    free(logits_cpu);
-    free(expected_logits);
-    free(expected_loss);
-    free(expected_grads_memory);
-    free(grads_memory_cpu);
-    free(grads_memory_cpu_float);
+    gpt2_free(&model, q);
+    common_free(model, q);
+    free(x, q);
+    free(y, q);
+    free(logits_cpu_raw, q);
+    free(logits_cpu, q);
+    free(expected_logits, q);
+    free(expected_loss, q);
+    free(expected_grads_memory, q);
+    free(grads_memory_cpu, q);
+    free(grads_memory_cpu_float, q);
     return 0;
 }

@@ -56,7 +56,7 @@ enum PrecisionMode {
 // Specific configurations based on the enabled precision
 //#if defined(ENABLE_FP32)
 typedef float floatX;
-//#define PRECISION_MODE PRECISION_FP32
+#define PRECISION_MODE PRECISION_FP32
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 //#elif defined(ENABLE_FP16)
 //typedef sycl::half floatX;

@@ -13,6 +13,11 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <oneapi/dnnl/dnnl_graph.hpp>
+#include <oneapi/dnnl/dnnl_graph_sycl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
+#include "llmc/sycl_utils.h"
+
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step
@@ -34,42 +39,39 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines:
 // WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
 // NVTX_RANGE_FN
-#include "llmc/cuda_common.h"
+#include "llmc/sycl_common.h"
 // defines:
 // Packed128, f128, x128
 // warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel
-#include "llmc/cuda_utils.dp.hpp"
-// defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
-// defines: cublas_compute, cublaslt_handle, cublas_handle
-#include "llmc/cublas_common.h"
+#include "llmc/sycl_utils.h"
 // ----------- Layer implementations in CUDA -----------
 // defines: encoder_forward, encoder_backward
-#include "llmc/encoder.dp.hpp"
+#include "llmc/encoder.h"
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
-#include "llmc/layernorm.dp.hpp"
+#include "llmc/layernorm.h"
 // defines: gelu_forward, gelu_backward_inplace
-#include "llmc/gelu.dp.hpp"
-#ifdef ENABLE_CUDNN
+#include "llmc/gelu.h"
+#ifdef ENABLE_DNN
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
-#include "llmc/cudnn_att.h"
+#include "llmc/dnn_att.h"
 #else
 // defines: attention_forward, attention_backward
-#include "llmc/attention.dp.hpp"
+#include "llmc/attention.h"
 #endif
 // defines: matmul_forward, matmul_backward
-#include "llmc/matmul.dp.hpp"
+#include "llmc/matmul.h"
 // defines: fused_classifier
-#include "llmc/fused_classifier.dp.hpp"
+#include "llmc/fused_classifier.h"
 // defines: adamw_kernel3
-#include "llmc/adamw.dp.hpp"
+#include "llmc/adamw.h"
 // defines: global_norm_squared
-#include "llmc/global_norm.dp.hpp"
+#include "llmc/global_norm.h"
 #include <cmath>
 
 // ----------- Multi-GPU support -----------
 #ifdef MULTI_GPU
 #include <mpi.h>
-#include <nccl.h>
+#include <oneapi/ccl.hpp>
 #endif
 
 // ----------------------------------------------------------------------------
@@ -79,7 +81,7 @@ dpct::device_info deviceProp; // fills in common_start()
 // ----------------------------------------------------------------------------
 // Multi-GPU related
 #ifdef MULTI_GPU
-
+/*
 #if defined(ENABLE_FP32)
 const ncclDataType_t ncclFloatX = ncclFloat;
 #elif defined(ENABLE_FP16)
@@ -94,6 +96,9 @@ void nccl_check(ncclResult_t status, const char *file, int line) {
         exit(EXIT_FAILURE);
     }
 }
+*/
+
+
 #define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
 
 void mpi_check(int status, const char *file, int line) {
@@ -322,7 +327,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
+void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, sycl::queue &q) {
     // calculate the total number of parameters and bytes across all tensors
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -330,14 +335,9 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     }
     // malloc all parameters all at once on the device
     void* params_memory;
-    /*
-    DPCT1064:303: Migrated cudaMalloc call is used in a macro/template
-    definition and may not be valid for all macro/template uses. Adjust the
-    code.
-    */
-    cudaCheck(DPCT_CHECK_ERROR(
-        params_memory = (void *)sycl::malloc_device(
-            num_parameters_bytes, dpct::get_in_order_queue())));
+    
+    params_memory = (void *)sycl::malloc_device(
+            num_parameters_bytes, q);
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
@@ -383,7 +383,7 @@ typedef struct dpct_type_471827 {
     floatX* output;
 } ActivationTensors;
 
-void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config, int recompute) {
+void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config, int recompute, sycl::queue &q) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
@@ -448,20 +448,14 @@ void fill_in_grad_act_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config co
     #endif
 }
 
-void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
+void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n, sycl::queue &q) {
     size_t num_activations = 0;
     for (size_t i = 0; i < n; i++) {
         num_activations += act_sizes[i];
     }
     void* acts_memory;
-    /*
-    DPCT1064:304: Migrated cudaMalloc call is used in a macro/template
-    definition and may not be valid for all macro/template uses. Adjust the
-    code.
-    */
-    cudaCheck(DPCT_CHECK_ERROR(
-        acts_memory = (void *)sycl::malloc_device(
-            num_activations * sizeof(floatX), dpct::get_in_order_queue())));
+    acts_memory = (void *)sycl::malloc_device(
+            num_activations * sizeof(floatX), q);
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
         // extra protection so we don't accidentally use an empty buffer
@@ -475,24 +469,24 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
     return acts_memory;
 }
 
-void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
+void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes, sycl::queue &q) {
     floatX** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
     };
-    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
+    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS, q);
 }
 
-void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
+void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes, sycl::queue &q) {
     floatX** ptrs[] = {
         &acts->bt4c, &acts->residual3,
-        #ifndef ENABLE_CUDNN
-        &acts->preatt,
+        #ifndef ENABLE_DNN
+        &acts->preatt, //to-do enable dnn graph backward
         #endif
     };
-    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
+    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS, q);
 }
 
 typedef struct dpct_type_700314 {
@@ -568,7 +562,7 @@ void gpt2_init_common(GPT2 *model) {
     model->recompute = 1; // good default: recompute gelu but not layernorm
 }
 
-void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path, sycl::queue &q) {
     // write the model to a checkpoint file
     printf0("Writing model to %s\n", checkpoint_path);
     FILE *model_file = fopenCheck(checkpoint_path, "wb");
@@ -587,18 +581,14 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fwrite(model_header, sizeof(int), 256, model_file);
     // write the parameters
     void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
-    cudaCheck(
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(params_memory_cpu, model->params_memory,
-                                     model->num_parameters_bytes)
-                             .wait()));
+    q.memcpy(params_memory_cpu, model->params_memory,model->num_parameters_bytes).wait();
     fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
     free(params_memory_cpu);
     // close file, we're done
     fcloseCheck(model_file);
 }
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, sycl::queue &q) {
 
     if (PRECISION_MODE == PRECISION_FP16) {
         // TODO for later perhaps, would require us dynamically converting the
@@ -628,7 +618,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
     if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
         fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
-        fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
+        fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2 PRECISION=FP32`\n");
         fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
         exit(EXIT_FAILURE);
     }
@@ -652,23 +642,19 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
 
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, q);
 
     // read in all the parameters from file and copy them to device
     void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
     freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
-    cudaCheck(
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(model->params_memory, params_memory_cpu,
-                                     model->num_parameters_bytes)
-                             .wait()));
-    free(params_memory_cpu);
+    q.memcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes).wait();
+    free(params_memory_cpu, q);
     fcloseCheck(model_file);
 
     gpt2_init_common(model);
 }
 
-void gpt2_build_from_random(GPT2 *model, int depth) {
+void gpt2_build_from_random(GPT2 *model, int depth, sycl::queue &q) {
     // init random (training from scratch)
 
     // parameterize the size of gpt2 based only on the depth of the model (num_layers)
@@ -696,7 +682,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
         model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
     }
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, q);
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
@@ -751,18 +737,17 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     }
 
     // copy them to GPU
-    cudaCheck(
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(model->params_memory, params_memory_cpu,
+    q.memcpy(model->params_memory, params_memory_cpu,
                                      model->num_parameters_bytes)
-                             .wait()));
+                             .wait();
     free(params_memory_cpu);
 
     gpt2_init_common(model);
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
-    NVTX_RANGE_FN();
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps, sycl::queue &q , engine::kind &ekind) {
+    
+    grad_accum_steps =1;
     // targets are optional and could be NULL
     // in this function we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
@@ -794,45 +779,25 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         model->batch_size = B;
         model->seq_len = T;
         // allocate the space
-        fill_in_activation_sizes(model->act_sizes, B, T, model->config, model->recompute);
+        fill_in_activation_sizes(model->act_sizes, B, T, model->config, model->recompute, q);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
         printf0("allocating %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
-        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes, q);
         // also create memory for caching inputs and targets
-        /*
-        DPCT1064:305: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(model->inputs = sycl::malloc_device<int>(
-                                       B * T, dpct::get_in_order_queue())));
-        /*
-        DPCT1064:306: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(model->targets = sycl::malloc_device<int>(
-                                       B * T, dpct::get_in_order_queue())));
-        /*
-        DPCT1064:307: Migrated cudaMallocHost call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(
-            model->cpu_losses =
-                sycl::malloc_host<floatX>(B * T, dpct::get_in_order_queue())));
-        /*
-        DPCT1064:308: Migrated cudaMallocHost call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(
-            model->cpu_losses_fp32 =
-                sycl::malloc_host<float>(B * T, dpct::get_in_order_queue())));
+        model->inputs = sycl::malloc_device<int>(
+                                       B * T, q);
+        model->targets = sycl::malloc_device<int>(
+                                       B * T, q);
+        
+        model->cpu_losses =
+                sycl::malloc_host<floatX>(B * T, q);
+        
+        model->cpu_losses_fp32 =
+                sycl::malloc_host<float>(B * T, q);
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -844,27 +809,23 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
 
     // copy inputs/targets to the model
     // todo - inputs is copied on default stream so this synchronises CPU/GPU for now
-    cudaCheck(
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(model->inputs, inputs, B * T * sizeof(int))
-                             .wait()));
+    q.memcpy(model->inputs, inputs, B * T * sizeof(int))
+                             .wait();
     if (targets != NULL) {
-        cudaCheck(DPCT_CHECK_ERROR(
-            dpct::get_in_order_queue()
-                .memcpy(model->targets, targets, B * T * sizeof(int))
-                .wait()));
+        q.memcpy(model->targets, targets, B * T * sizeof(int))
+                .wait();
     }
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, q); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C);
+    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, q);
 
     for (int l = 0; l < L; l++) {
-        NvtxRange layer_range("Layer", l);
+        
 
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -897,24 +858,24 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
-        #ifdef ENABLE_CUDNN
+        #ifdef ENABLE_DNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, q);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, q, ekind);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         floatX* scratch = (floatX*)acts.output;
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, q);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, q);
         #endif
 
-        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, q);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, q);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, q);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, q);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, q);
 
         // OK, fusion across blocks.
         if(l+1 != L) {
@@ -924,27 +885,25 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
-                                    B * T, C);
+                                    B * T, C, q);
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj,
                                     params.lnfw, params.lnfb,
-                                    B * T, C);
+                                    B * T, C, q);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, q);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
-        NvtxRange classifier_and_loss_range("classifier_and_loss");
+        
         // fused classifier: does the forward pass and first part of the backward pass
         const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
-        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp);
+        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, q);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
-        cudaCheck(DPCT_CHECK_ERROR(
-            dpct::get_in_order_queue()
-                .memcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX))
-                .wait()));
+        q.memcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX))
+                .wait();
         float mean_loss = 0.0f;
         for (int i = 0; i < B*T; i++) {
             float loss = (float)(model->cpu_losses[i]);
@@ -959,19 +918,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
     }
 }
 
-void gpt2_zero_grad(GPT2 *model) {
-    NVTX_RANGE_FN();
+void gpt2_zero_grad(GPT2 *model, sycl::queue &q) {
     if (model->grads_memory != NULL) {
-        cudaCheck(
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memset(model->grads_memory, 0,
-                                         model->num_parameters * sizeof(floatX))
-                                 .wait()));
+        q.memset(model->grads_memory, 0,model->num_parameters * sizeof(floatX))
+                                 .wait();
     }
 }
 
-void gpt2_backward(GPT2 *model, int* inputs) {
-    NVTX_RANGE_FN();
+void gpt2_backward(GPT2 *model, int* inputs, sycl::queue &q) {
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
@@ -982,7 +936,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
         printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof, q);
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
         size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
@@ -993,9 +947,9 @@ void gpt2_backward(GPT2 *model, int* inputs) {
             model->num_grad_acts += bw_act_sizes[i];
         }
         printf0("allocating %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(floatX) / (1024 * 1024)));
-        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
+        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes, q);
         // init gradients of parameters and activations to zero
-        gpt2_zero_grad(model);
+        gpt2_zero_grad(model, q);
         // initialise cpu scratch buffers for encoder backward
         size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
         assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
@@ -1020,10 +974,8 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     GradActTensors grads_acts = model->grads_acts;
 
     // reset residual stream gradients (put here to work with gradient accumulation)
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::get_in_order_queue()
-            .memset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX))
-            .wait()));
+    q.memset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX))
+            .wait();
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float*  scratchF = (float*)acts.output;
@@ -1034,11 +986,11 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, q);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, q);
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -1046,8 +998,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
-        NvtxRange layer_range("Layer", l);
-
+        
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
@@ -1094,40 +1045,40 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, q);
         }
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
-        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, q);
+        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C, q);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, q);
         }
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, q);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, q);
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, q);
 
-        #ifdef ENABLE_CUDNN
+        #ifdef ENABLE_DNN // dnn backward is not added
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C);
+        //attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C); //to-do
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, q);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, q);
         }
         // QKV parameter gradients
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, q);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, q);
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
-                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state));
+                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), q);
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
@@ -1146,7 +1097,6 @@ float multi_gpu_cpu_float_sum(float value) {
 // todo - this version only works if all the parameters are the same size (floatX)
 void gpt2_multi_gpu_loss_and_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    NVTX_RANGE_FN();
     // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
@@ -1169,14 +1119,13 @@ void gpt2_multi_gpu_loss_and_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_
 #endif
 }
 
-float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
+float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config, sycl::queue &q) {
     // update the model parameters using the AdamW optimizer
     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
     // so we may not be responsible for the entire parameter tensor
     // also, this function was very simple a while back but become very complex, only because we want to
     // selectively weight decay some, but not all tensors :(
     // TODO: revisit and probably refactor this entire function
-    NVTX_RANGE_FN();
     size_t shard_num_parameters = multi_gpu_config->shard_num_parameters; // num parameters we are responsible for
     size_t shard_offset = multi_gpu_config->shard_offset; // offset into the full parameter tensor
     floatX* params_memory = (floatX*)model->params_memory;
@@ -1186,58 +1135,35 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     if (model->m_memory == NULL) {
         printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
         printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
-        /*
-        DPCT1064:309: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(
-            model->m_memory = sycl::malloc_device<float>(
-                shard_num_parameters, dpct::get_in_order_queue())));
-        /*
-        DPCT1064:310: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(
-            model->v_memory = sycl::malloc_device<float>(
-                shard_num_parameters, dpct::get_in_order_queue())));
-        cudaCheck(
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memset(model->m_memory, 0,
-                                         shard_num_parameters * sizeof(float))
-                                 .wait()));
-        cudaCheck(
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memset(model->v_memory, 0,
-                                         shard_num_parameters * sizeof(float))
-                                 .wait()));
+        
+        model->m_memory = sycl::malloc_device<float>(
+                shard_num_parameters, q);
+        
+        model->v_memory = sycl::malloc_device<float>(
+                shard_num_parameters, q);
+        
+        q.memset(model->m_memory, 0, shard_num_parameters * sizeof(float))
+                                 .wait();
+        q.memset(model->v_memory, 0, shard_num_parameters * sizeof(float))
+                                 .wait();
     }
     if (model->use_master_weights == 1 && model->master_weights == NULL) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        /*
-        DPCT1064:311: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(
-            model->master_weights = sycl::malloc_device<float>(
-                shard_num_parameters, dpct::get_in_order_queue())));
+        
+        model->master_weights = sycl::malloc_device<float>(
+                shard_num_parameters, q);
         size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
-        /*
-        DPCT1049:17: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
+        
+        
         {
             dpct::has_capability_or_fail(
-                dpct::get_in_order_queue().get_device(), {sycl::aspect::fp16});
+                q.get_device(), {sycl::aspect::fp16});
 
-            dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
+            q.submit([&](sycl::handler &cgh) {
                 float *model_master_weights_ct0 = model->master_weights;
                 const sycl::ext::oneapi::bfloat16
                     *params_memory_shard_offset_ct1 =
-                        params_memory + shard_offset;
+                        reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(params_memory + shard_offset);
 
                 cgh.parallel_for(
                     sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
@@ -1250,12 +1176,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                     });
             });
         }
-        /*
-        DPCT1010:247: SYCL uses exceptions to report errors and does not use the
-        error codes. The call was replaced with 0. You need to rewrite this
-        code.
-        */
-        cudaCheck(0);
+        
     }
 
     // gradient clipping
@@ -1265,18 +1186,16 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_loss_and_grad_reduce,
         // grads_memory only contains the averaged gradients at the local shard
         // so we only calculate the grad norm at the grads_memory belonging to the local shard
-        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters);
+        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters, q);
     } else {
         // the ncclAllReduce() in gpt2_multi_gpu_loss_and_grad_reduce has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
-        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters);
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, q);
     }
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::get_in_order_queue()
-            .memcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float))
-            .wait()));
+    q.memcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float))
+            .wait();
     if (multi_gpu_config->zero_stage == 1) {
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
@@ -1349,18 +1268,13 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
             float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
             // ok finally call the kernel
             size_t num_blocks = CEIL_DIV(local_params, block_size);
-            /*
-            DPCT1049:18: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
+            
             {
                 dpct::has_capability_or_fail(
-                    dpct::get_in_order_queue().get_device(),
+                    q.get_device(),
                     {sycl::aspect::fp16});
 
-                dpct::get_in_order_queue().parallel_for(
+                q.parallel_for(
                     sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) *
                                           sycl::range<3>(1, 1, block_size),
                                       sycl::range<3>(1, 1, block_size)),
@@ -1375,11 +1289,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // advance the offset pointer to the next parameter tensor
         offset += num_parameters;
     }
-    /*
-    DPCT1010:248: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
     return grad_norm_cpu;
 }
 
@@ -1393,7 +1303,7 @@ void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
                                 multi_gpu_config->shard_num_parameters, ncclFloatX,
                                 multi_gpu_config->nccl_comm, 0));
     }
-    cudaCheck(cudaGetLastError());
+    
 #endif
 }
 
@@ -1427,29 +1337,19 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     return mfu;
 }
 
-void gpt2_free(GPT2 *model) {
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->params_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->grads_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->m_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->v_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->master_weights, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->acts_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->grads_acts_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->inputs, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->targets, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        sycl::free(model->cpu_losses, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        sycl::free(model->cpu_losses_fp32, dpct::get_in_order_queue())));
+void gpt2_free(GPT2 *model,  sycl::queue &q) {
+    
+    sycl::free(model->params_memory, q);
+    sycl::free(model->grads_memory, q);
+    sycl::free(model->m_memory, q);
+    sycl::free(model->v_memory, q);
+    sycl::free(model->master_weights, q);
+    sycl::free(model->acts_memory, q);
+    sycl::free(model->grads_acts_memory, q);
+    sycl::free(model->inputs, q);
+    sycl::free(model->targets, q);
+    sycl::free(model->cpu_losses, q);
+    sycl::free(model->cpu_losses_fp32, q);
     free(model->workload_indices);
     free(model->bucket_info);
 }
@@ -1457,61 +1357,40 @@ void gpt2_free(GPT2 *model) {
 // ----------------------------------------------------------------------------
 // common init & free code for all of train/test/profile
 
-void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
+void common_start(bool override_enable_tf32, bool print_device_info, sycl::queue &q) {
 
-    // get CUDA device infos
-    dpct::get_device_info(deviceProp, dpct::dev_mgr::instance().get_device(
-                                          multi_gpu_config.local_device_idx));
+    // get SYCL device infos
+    dpct::device_info deviceProp;
+   // dpct::get_device_info(deviceProp, dpct::dev_mgr::instance().get_device(
+   //                                       multi_gpu_config.local_device_idx));
     if (print_device_info) {
         printf("[System]\n");
         printf("Device %d: %s\n", multi_gpu_config.local_device_idx,
                deviceProp.get_name());
     }
 
-    // set up cuBLAS and cuBLASLt
-    cublasCheck(DPCT_CHECK_ERROR(cublas_handle = new dpct::blas::descriptor()));
-    /*
-    DPCT1007:249: Migration of cublasLtCreate is not supported.
-    */
-    cublasCheck(cublasLtCreate(&cublaslt_handle));
-    /*
-    DPCT1064:312: Migrated cudaMalloc call is used in a macro/template
-    definition and may not be valid for all macro/template uses. Adjust the
-    code.
-    */
-    cudaCheck(DPCT_CHECK_ERROR(
-        cublaslt_workspace = (void *)sycl::malloc_device(
-            cublaslt_workspace_size, dpct::get_in_order_queue())));
+    
+    
+    cublaslt_workspace = (void *)sycl::malloc_device(
+            cublaslt_workspace_size, q);
 
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    /*
-    DPCT1005:250: The SYCL device version is different from CUDA Compute
-    Compatibility. You may need to rewrite this code.
-    */
+    
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 &&
                        deviceProp.get_major_version() >= 8 &&
                        override_enable_tf32;
-    /*
-    DPCT1027:251: The call to cublasSetMathMode was replaced with 0 because this
-    functionality is redundant in SYCL.
-    */
-    cublasCheck(0);
-    cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+   
+    cublas_compute = CUBLAS_COMPUTE_32F;
 
-    #ifdef ENABLE_CUDNN
+    #ifdef ENABLE_DNN
     create_cudnn();
     #endif
 }
 
-void common_free(GPT2 &model) {
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(cublaslt_workspace, dpct::get_in_order_queue())));
-    cublasCheck(DPCT_CHECK_ERROR(delete (cublas_handle)));
-    /*
-    DPCT1007:252: Migration of cublasLtDestroy is not supported.
-    */
-    cublasCheck(cublasLtDestroy(cublaslt_handle));
-#ifdef ENABLE_CUDNN
+void common_free(GPT2 &model, sycl::queue &q) {
+    sycl::free(cublaslt_workspace, q);
+    
+#ifdef ENABLE_DNN
     destroy_cudnn();
     #endif
 }
@@ -1524,7 +1403,7 @@ void common_free(GPT2 &model) {
 // the goal is that we can resume optimization from any checkpoint, bit-perfect
 // note that "state" refers to things not already saved in the model checkpoint file
 
-void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
+void save_state(const char* filename, int step, GPT2* model, DataLoader* loader, sycl::queue &q) {
     printf("Writing state to %s\n", filename);
     FILE *state_file = fopenCheck(filename, "wb");
     int state_header[256];
@@ -1545,21 +1424,18 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
-    cudaCheck(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                   .memcpy(cpu_buffer, model->m_memory,
-                                           shard_num_parameters * sizeof(float))
-                                   .wait()));
+    q.memcpy(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float))
+                                   .wait();
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                   .memcpy(cpu_buffer, model->v_memory,
+    q.memcpy(cpu_buffer, model->v_memory,
                                            shard_num_parameters * sizeof(float))
-                                   .wait()));
+                                   .wait();
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    free(cpu_buffer);
+    free(cpu_buffer, q);
     fclose(state_file);
 }
 
-void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
+void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename, sycl::queue &q) {
     FILE *state_file = fopenCheck(filename, "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
@@ -1578,25 +1454,19 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     if (model->m_memory == NULL) {
         printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
         printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(DPCT_CHECK_ERROR(
-            model->m_memory = sycl::malloc_device<float>(
-                shard_num_parameters, dpct::get_in_order_queue())));
-        cudaCheck(DPCT_CHECK_ERROR(
-            model->v_memory = sycl::malloc_device<float>(
-                shard_num_parameters, dpct::get_in_order_queue())));
+        model->m_memory = sycl::malloc_device<float>(
+                shard_num_parameters, q);
+        model->v_memory = sycl::malloc_device<float>(
+                shard_num_parameters, q);
     }
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                   .memcpy(model->m_memory, cpu_buffer,
-                                           shard_num_parameters * sizeof(float))
-                                   .wait()));
+    q.memcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float))
+                                   .wait();
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                   .memcpy(model->v_memory, cpu_buffer,
-                                           shard_num_parameters * sizeof(float))
-                                   .wait()));
-    free(cpu_buffer);
+    q.memcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float))
+                                   .wait();
+    free(cpu_buffer, q);
     fclose(state_file);
 }
 
@@ -1605,7 +1475,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
 // unclaimed flags lol: k,p
 
 void error_usage() {
-    fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
+    fprintf(stderr, "Usage:   ./train_gpt2 [options]\n");
     fprintf(stderr, "Options:\n");
     // file system input / output
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
@@ -1645,7 +1515,18 @@ void error_usage() {
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
+    
+    auto ekind = engine::kind::gpu;
+        
+    sycl::queue q = (ekind == engine::kind::gpu)
+            ? sycl::queue(
+                    sycl::gpu_selector_v, sycl::property::queue::in_order {})
+            : sycl::queue(
+                    sycl::cpu_selector_v, sycl::property::queue::in_order {});
+
+    
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    
 
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
@@ -1748,9 +1629,9 @@ int main(int argc, char *argv[]) {
     printf0("| recompute             | %-50d |\n", recompute);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
-    common_start(override_enable_tf32, false); // common init code for train/test/profile
+    common_start(override_enable_tf32, false, q); // common init code for train/test/profile
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
-                              ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
+                              ? (cublas_compute ==  CUBLAS_COMPUTE_32F ? "FP32":"FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
     printf0("| device                | %-50s |\n", deviceProp.get_name());
     printf0("| peak TFlops           | %-50.1f |\n",
@@ -1779,16 +1660,16 @@ int main(int argc, char *argv[]) {
     // this variable as a checkpoint filename, and load that checkpoint
     assert(strlen(load_filename) >= 2);
     if (resuming == 1) {
-        gpt2_build_from_checkpoint(&model, filename_buffer);
+        gpt2_build_from_checkpoint(&model, filename_buffer, q);
     } else if (load_filename[0] == 'd') {
         int depth = atoi(load_filename + 1);
         if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
-            gpt2_build_from_random(&model, depth);
+            gpt2_build_from_random(&model, depth, q);
         } else {
             exit(EXIT_FAILURE);
         }
     } else {
-        gpt2_build_from_checkpoint(&model, load_filename);
+        gpt2_build_from_checkpoint(&model, load_filename, q);
     }
 
     model.use_master_weights = use_master_weights;
@@ -1875,34 +1756,29 @@ int main(int argc, char *argv[]) {
     int step = 0;
     if (resuming == 1) {
         snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
-        load_state(&step, &model, &train_loader, filename_buffer);
+        load_state(&step, &model, &train_loader, filename_buffer, q);
     }
 
     // train
     dpct::event_ptr start, end;
-    cudaCheck(DPCT_CHECK_ERROR(start = new sycl::event()));
-    cudaCheck(DPCT_CHECK_ERROR(end = new sycl::event()));
-    /*
-    DPCT1027:313: The call to cudaProfilerStart was replaced with 0 because SYCL
-    currently does not support this function. Remove the profiler API will not
-    impact the outcome.
-    */
-    cudaCheck(0);
+    start = new sycl::event();
+    end = new sycl::event();
+    
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
     for (; step <= train_num_batches; step++) {
-        NvtxRange step_range("Train step", step);
+       
 
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss (all processes collaborate)
         if (step % val_loss_every == 0 || last_step) {
-            NvtxRange validation_range("validation");
+           
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T, 1, q, ekind);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1914,13 +1790,13 @@ int main(int argc, char *argv[]) {
         // once in a while estimate HellaSwag accuracy (all processes collaborate)
         if (run_hellaswag &&
            ((step > 0 && step % val_loss_every == 0) || last_step)) {
-            NvtxRange evaluation_range("evaluation");
+            
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
             for (int i = 0; i < eval_loader.num_batches; i++) {
                 if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
                 evalloader_next_batch(&eval_loader);
-                gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T, 1, q, ekind);
                 int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
                 eval_acc_norm += (float)correct;
             }
@@ -1933,7 +1809,6 @@ int main(int argc, char *argv[]) {
         // once in a while do model inference to print generated text (only rank 0)
         if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
            (step > 0 && (step % sample_every) == 0 || last_step)) {
-            NvtxRange generation_range("generation");
             unsigned long long sample_rng_state = 1337;
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
@@ -1943,23 +1818,20 @@ int main(int argc, char *argv[]) {
             // now sample from the model autoregressively
             printf("generating:\n---\n");
             for (int t = 1; t < genT; t++) {
-                NvtxRange generation_range("Generation step", t);
                 // note that inference is very wasteful here because for each token
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_forward(&model, gen_tokens, NULL, B, T, 1, q, ekind);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                cudaCheck(DPCT_CHECK_ERROR(
-                    dpct::get_in_order_queue()
-                        .memcpy(cpu_logits_raw, logits,
+                q.memcpy(cpu_logits_raw, logits,
                                 model.config.vocab_size * sizeof(floatX))
-                        .wait()));
+                        .wait();
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
                 for (int i = 0; i < model.config.vocab_size; i++) {
                     cpu_logits[i] = (float)cpu_logits_raw[i];
@@ -1988,11 +1860,11 @@ int main(int argc, char *argv[]) {
             // only rank 0 writes the model file because it is the same across all ranks
             if (multi_gpu_config.process_rank == 0) {
                 snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, step);
-                gpt2_write_to_checkpoint(&model, filename_buffer);
+                gpt2_write_to_checkpoint(&model, filename_buffer, q);
             }
             // all ranks write their state file
             snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, step, multi_gpu_config.process_rank);
-            save_state(filename_buffer, step, &model, &train_loader);
+            save_state(filename_buffer, step, &model, &train_loader, q);
             // DONE file is a signal that this checkpoint as a whole is complete
             multi_gpu_barrier(&multi_gpu_config);
             if (multi_gpu_config.process_rank == 0) {
@@ -2012,7 +1884,7 @@ int main(int argc, char *argv[]) {
 
         // --------------- TRAINING SECTION BEGIN -----------------
         // do one training step, doing forward/backward/update on total_batch_size tokens
-        dpct::sync_barrier(start);
+        //dpct::sync_barrier(start, q);
         // gradient accumulation loop over micro-batches
         float lossf = 0.0f; // for getting the mean loss over the accumulation steps
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
@@ -2023,10 +1895,10 @@ int main(int argc, char *argv[]) {
                 dataloader_next_batch(&train_loader);
             }
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
-            gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
+            gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps, q, ekind);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model, train_loader.inputs);
+            gpt2_backward(&model, train_loader.inputs, q);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
@@ -2046,31 +1918,27 @@ int main(int argc, char *argv[]) {
             step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
         }
         // update the model parameters
-        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config, q);
         gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
-        gpt2_zero_grad(&model);
-        /*
-        DPCT1024:314: The original code returned the error code that was further
-        consumed by the program logic. This original code was replaced with 0.
-        You may need to rewrite the program logic consuming the error code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(dpct::sync_barrier(end)));
-        cudaCheck(DPCT_CHECK_ERROR(
-            end->wait_and_throw())); // wait for the end event to finish to get
+        gpt2_zero_grad(&model, q);
+        
+        //dpct::sync_barrier(end, q);
+        end->wait_and_throw(); // wait for the end event to finish to get
                                      // correct timings
         // --------------- TRAINING SECTION END -------------------
         // everything that follows now is just diagnostics, prints, logging, etc.
 
         // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
+        /*
         float time_elapsed_ms;
-        cudaCheck(DPCT_CHECK_ERROR(
+        
             time_elapsed_ms =
                 (end->get_profiling_info<
                      sycl::info::event_profiling::command_end>() -
                  start->get_profiling_info<
                      sycl::info::event_profiling::command_start>()) /
-                1000000.0f));
+                1000000.0f;
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
         float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
         float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
@@ -2088,10 +1956,6 @@ int main(int argc, char *argv[]) {
         logger_log_train(&logger, step, model.mean_loss);
 
         // disable the profiler after 3 steps of optimization
-        /*
-        DPCT1026:315: The call to cudaProfilerStop was removed because SYCL
-        currently does not support this function. Remove the profiler API will
-        not impact the outcome.
         */
         if (step == 3) {}
     }
@@ -2099,18 +1963,18 @@ int main(int argc, char *argv[]) {
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
     // free and destroy everything
-    cudaCheck(DPCT_CHECK_ERROR(dpct::destroy_event(end)));
-    cudaCheck(DPCT_CHECK_ERROR(dpct::destroy_event(start)));
+    dpct::destroy_event(end);
+    dpct::destroy_event(start);
     if (run_hellaswag) { evalloader_free(&eval_loader); }
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
-    free(cpu_logits_raw);
-    free(cpu_logits);
-    free(gen_tokens);
+    free(cpu_logits_raw, q);
+    free(cpu_logits, q);
+    free(gen_tokens, q);
     multi_gpu_config_free(&multi_gpu_config);
-    gpt2_free(&model);
-    common_free(model);
+    gpt2_free(&model, q);
+    common_free(model, q);
     return 0;
 }
 #endif
