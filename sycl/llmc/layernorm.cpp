@@ -18,7 +18,7 @@ E.g., the layernorms are connected to the residuals so we += in layernorm backwa
 #include "sycl_utils.h"
 
 // ----------------------------------------------------------------------------
-// CUDA kernels
+// SYCL kernels
 
 void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,

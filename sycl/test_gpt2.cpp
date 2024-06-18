@@ -97,7 +97,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    auto ekind = engine::kind::gpu;
+    auto ekind = engine::kind::cpu;
         
     sycl::queue q = (ekind == engine::kind::gpu)
             ? sycl::queue(
@@ -331,14 +331,14 @@ int main(int argc, char *argv[]) {
     // free everything
     gpt2_free(&model, q);
     common_free(model, q);
-    free(x, q);
-    free(y, q);
-    free(logits_cpu_raw, q);
-    free(logits_cpu, q);
-    free(expected_logits, q);
-    free(expected_loss, q);
-    free(expected_grads_memory, q);
-    free(grads_memory_cpu, q);
-    free(grads_memory_cpu_float, q);
+    free(x);
+    free(y);
+    free(logits_cpu_raw);
+    free(logits_cpu);
+    free(expected_logits);
+    free(expected_loss);
+    free(expected_grads_memory);
+    free(grads_memory_cpu);
+    free(grads_memory_cpu_float);
     return 0;
 }

@@ -24,6 +24,12 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <unistd.h>
 #include <dpct/blas_utils.hpp>
 
+#include <oneapi/dnnl/dnnl_graph.hpp>
+#include <oneapi/dnnl/dnnl_graph_sycl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
+#include "llmc/sycl_utils.h"
+#include "llmc/sycl_common.h"
+
 // GPU / CUDA related
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
@@ -34,34 +40,15 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include "llmc/dataloader.h"
 #include <dpct/lib_common_utils.hpp>
 
+using namespace dnnl;
+
 // ----------------------------------------------------------------------------
 // CUDA utils
 
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
-// CUDA error checking
-void cudaCheck(dpct::err0 error, const char *file, int line) {
-
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-
-// cuBLAS error checking
-void cublasCheck(int status, const char *file, int line)
-{
-    if (status != 0) {
-        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
-        exit(EXIT_FAILURE);
-    }
-}
-#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
-
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
-static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
-static void* cublaslt_workspace = NULL;
-static dpct::library_data_t cublas_compute_type;
-dpct::blas::descriptor_ptr cublas_handle;
-cublasLtHandle_t cublaslt_handle;
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -126,11 +113,8 @@ SYCL_EXTERNAL void layernorm_forward_kernel3(
     const sycl::nd_item<3> &item_ct1) {
     sycl::group<3> block = item_ct1.get_group();
     sycl::sub_group warp = item_ct1.get_sub_group();
-    /*
-    DPCT1007:254: Migration of
-    cooperative_groups::thread_block_tile::meta_group_size is not supported.
-    */
-    int idx = item_ct1.get_group(2) * warp.meta_group_size() +
+    
+    int idx = item_ct1.get_group(2) * WARP_SIZE +
               item_ct1.get_sub_group().get_group_linear_id();
     if(idx >= N) {
         return;
@@ -150,7 +134,7 @@ SYCL_EXTERNAL void layernorm_forward_kernel3(
     float m = sum / C;
     if (item_ct1.get_sub_group().get_local_linear_id() == 0 &&
         mean != nullptr) {
-        __stcs(mean + idx, m);
+        *(mean + idx) = m;
     }
 
     // rstd
@@ -165,7 +149,7 @@ SYCL_EXTERNAL void layernorm_forward_kernel3(
     float s = sycl::rsqrt(sum / C + 1e-5f);
     if (item_ct1.get_sub_group().get_local_linear_id() == 0 &&
         rstd != nullptr) {
-        __stcs(rstd + idx, s);
+        *(rstd + idx) = s;
     }
 
     // final normalization and scaling by weight/bias
@@ -175,8 +159,8 @@ SYCL_EXTERNAL void layernorm_forward_kernel3(
         // load and store using the .cs "streaming" hint to the compiler,
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+        float n = s * ((float)*(x + c) - m);
+        *(o+c) = n * weight[c] + bias[c];
     }
 }
 
@@ -196,9 +180,9 @@ SYCL_EXTERNAL void permute_kernel(float *q, float *k, float *v,
         int n = rest / d;
         int d_ = rest % d;
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        q[idx] = __ldcs(&inp[inp_idx]);
-        k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-        v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
+        q[idx] = (inp[inp_idx]);
+        k[idx] = (inp[inp_idx + NH * d]);
+        v[idx] = (inp[inp_idx + 2 * (NH * d)]);
     }
 }
 
@@ -237,7 +221,7 @@ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, int d,
         int n = rest / d;
         int d_ = rest % d;
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = __ldcs(&inp[idx]);
+        out[other_idx] = (inp[idx]);
     }
 }
 
@@ -281,12 +265,9 @@ SYCL_EXTERNAL void softmax_forward_kernel5(float *out, float inv_temperature,
     // part of the matrix close to the upper left corner, which benefits the
     // matmul operation that immediately follows.
     // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
-    /*
-    DPCT1007:255: Migration of
-    cooperative_groups::thread_block_tile::meta_group_size is not supported.
-    */
+    
     int idx = (item_ct1.get_group_range(2) - item_ct1.get_group(2) - 1) *
-                  warp.meta_group_size() +
+                  WARP_SIZE +
               item_ct1.get_sub_group().get_group_linear_id(); // backward order
     if(idx >= N * T) {
         return;
@@ -341,8 +322,10 @@ SYCL_EXTERNAL void softmax_forward_kernel5(float *out, float inv_temperature,
     for (int i = item_ct1.get_sub_group().get_local_linear_id(); i <= own_pos;
          i += item_ct1.get_sub_group().get_local_linear_range()) {
         // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, ev * norm);
+        float ev = sycl::native::exp(inv_temperature *
+                                     ((float)*(x + i) - global_maxval));
+
+        *(out + idx * T + i) = ev * norm;
     }
 }
 
@@ -351,7 +334,7 @@ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N,
     int idx = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
               item_ct1.get_local_id(2);
     if (idx < N) {
-        out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
+        out[idx] = (inp1[idx]) + (inp2[idx]);
     }
 }
 
@@ -423,12 +406,8 @@ void matmul_backward_bias_kernel4(float* dbias, const float* dout, int B, int T,
     }
     smem[lane_id + warp_id * item_ct1.get_sub_group().get_local_range().get(
                                  0)] = dout_sum;
-    /*
-    DPCT1065:256: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    
+    item_ct1.barrier(sycl::access::fence_space::local_space);
 
     // warp_id 0 reduces the shared memory column-wise, linearly
     dout_sum = 0.0f;
@@ -443,13 +422,7 @@ void matmul_backward_bias_kernel4(float* dbias, const float* dout, int B, int T,
 }
 
 // uses shared memory instead for the reduces
-/*
-DPCT1110:19: The total declared local variable size in device function
-layernorm_backward_kernel2 exceeds 128 bytes and may cause high register
-pressure. Consult with your hardware vendor to find the total register size
-available and adjust the code, or use smaller sub-group size to avoid high
-register pressure.
-*/
+
 void layernorm_backward_kernel2(float *dinp, float *dweight, float *dbias,
                                 const float *dout, const float *inp,
                                 const float *weight, const float *mean,
@@ -460,11 +433,8 @@ void layernorm_backward_kernel2(float *dinp, float *dweight, float *dbias,
 
     sycl::group<3> block = item_ct1.get_group();
     sycl::sub_group warp = item_ct1.get_sub_group();
-    /*
-    DPCT1007:259: Migration of
-    cooperative_groups::thread_block_tile::meta_group_size is not supported.
-    */
-    int idx = item_ct1.get_group(2) * warp.meta_group_size() +
+    
+    int idx = item_ct1.get_group(2) * WARP_SIZE +
               item_ct1.get_sub_group().get_group_linear_id();
     int N = B * T;
     if(idx >= N) { return; } // thread guards
@@ -489,12 +459,8 @@ void layernorm_backward_kernel2(float *dinp, float *dweight, float *dbias,
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-    /*
-    DPCT1065:257: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    
+    item_ct1.barrier(sycl::access::fence_space::local_space);
 
     // first: two reduce operations
     float dnorm_mean = 0.0f;
@@ -532,12 +498,8 @@ void layernorm_backward_kernel2(float *dinp, float *dweight, float *dbias,
         dval *= rstd_bt; // final scale
         dinp_bt[i] += dval;
     }
-    /*
-    DPCT1065:258: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    
+    item_ct1.barrier(sycl::access::fence_space::local_space);
 
     // write to global memory
         for (int i = item_ct1.get_local_id(2); i < C;
@@ -586,12 +548,8 @@ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, c
         block_acc[item_ct1.get_sub_group().get_group_linear_id()] =
             sycl::reduce_over_group(item_ct1.get_sub_group(), local_sum,
                                     sycl::plus<float>{});
-        /*
-        DPCT1065:20: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item_ct1.barrier();
+        
+        item_ct1.barrier(sycl::access::fence_space::local_space);
         local_sum = sycl::reduce_over_group(
             item_ct1.get_sub_group(),
             block_acc[item_ct1.get_sub_group().get_local_linear_id()],
@@ -601,8 +559,9 @@ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, c
              t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
-            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
-            __stcs(dpreatt_bth + t3, scale * acc);
+            float acc =
+                (float)*(att_bth + t3) * ((float)*(datt_bth + t3) - local_sum);
+            *(dpreatt_bth + t3) = scale * acc;
         }
     }
 }
@@ -674,12 +633,8 @@ prepare_softmax_blockwide_nofloat4(sycl::sub_group &warp, int idx,
         item_ct1.get_sub_group(), thread_maxval, sycl::maximum<float>{});
     // thread 0 in each warp writes to shared memory
     if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
-    /*
-    DPCT1065:260: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    
+    item_ct1.barrier(sycl::access::fence_space::local_space);
     // each thread now loads the maxval across previous warps
     // if the thread is "out of range" of data, use -FLT_MAX as the maxval
     warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
@@ -692,12 +647,8 @@ prepare_softmax_blockwide_nofloat4(sycl::sub_group &warp, int idx,
     float warp_sumval = sycl::reduce_over_group(
         item_ct1.get_sub_group(), thread_sumval, sycl::plus<float>{});
     if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
-    /*
-    DPCT1065:261: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    
+    item_ct1.barrier(sycl::access::fence_space::local_space);
     // same strategy, now reduce sumval across warps
     warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
     float block_sumval = sycl::reduce_over_group(
@@ -740,7 +691,7 @@ void fused_classifier_kernel3(float* logits, float* losses, float* probs,
          i += item_ct1.get_local_range(2)) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
-        float v = __ldcs(&logits_vec[i]);
+        float v = (logits_vec[i]);
         float prob = sycl::native::exp(v - sp.Offset) * sp.Scale;
         if (probs != NULL) {
             probs[idx * P + i] = prob;
@@ -755,17 +706,13 @@ void fused_classifier_kernel3(float* logits, float* losses, float* probs,
 
 void encoder_forward(float* out,
                      const int* inp, const float* wte, const float* wpe,
-                     int B, int T, int C) {
+                     int B, int T, int C, sycl::queue &q) {
     assert(C % 4 == 0);
     const int block_size = 512;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N / 4, block_size);
-    /*
-    DPCT1049:21: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    dpct::get_in_order_queue().parallel_for(
+    
+    q.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
@@ -774,45 +721,34 @@ void encoder_forward(float* out,
                                     (sycl::float4 *)wte, (sycl::float4 *)wpe, B,
                                     T, C, item_ct1);
         });
-    /*
-    DPCT1010:262: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+   
 }
 
 void encoder_backward(float* dwte, float* dwpe,
                     const float* dout, const int* inp,
-                    int B, int T, int C) {
+                    int B, int T, int C, sycl::queue &q) {
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    
+    q.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             encoder_backward_kernel(dwte, dwpe, dout, inp, B, T, C, item_ct1);
         });
-    /*
-    DPCT1010:263: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
 }
 
 void layernorm_forward(float* out, float* mean, float* rstd,
                        float* inp, float* weight, float* bias,
-                       int B, int T, int C) {
+                       int B, int T, int C, sycl::queue &q) {
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N * 32, block_size);
-    /*
-    DPCT1049:22: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    dpct::get_in_order_queue().parallel_for(
+    
+    q.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
@@ -820,11 +756,7 @@ void layernorm_forward(float* out, float* mean, float* rstd,
             layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C,
                                       item_ct1);
         });
-    /*
-    DPCT1010:264: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
 }
 
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
@@ -832,7 +764,8 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 // https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
 void matmul_forward_cublaslt(float* out,
                      float* inp, float* weight, float* bias,
-                     int B, int T, int C, int OC) {
+                     int B, int T, int C, int OC, sycl::queue &q_ct1) {
+try{    
     int has_bias = (bias != NULL);
 
     // check bias alignment
@@ -841,143 +774,71 @@ void matmul_forward_cublaslt(float* out,
         exit(EXIT_FAILURE);
     }
 
-    int returnedResults = 0;
-    cublasLtMatmulDesc_t operationDesc;
-    cublasLtMatmulPreference_t preference;
-    cublasLtMatrixLayout_t weightLayout;
-    cublasLtMatrixLayout_t inputLayout;
-    cublasLtMatrixLayout_t outputLayout;
-    cublasLtMatrixLayout_t biasLayout;
-    cublasLtMatmulHeuristicResult_t heuristic;
-
-    // create the operation descriptor
-    oneapi::mkl::transpose opNoTranspose = oneapi::mkl::transpose::nontrans;
-    oneapi::mkl::transpose opTranspose = oneapi::mkl::transpose::trans;
-    cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_BIAS;
-    /*
-    DPCT1007:265: Migration of cublasLtMatmulDescCreate is not supported.
-    */
-    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type,
-                                         dpct::library_data_t::real_float));
-    /*
-    DPCT1007:266: Migration of cublasLtMatmulDescSetAttribute is not supported.
-    */
-    cublasCheck(cublasLtMatmulDescSetAttribute(
-        operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose,
-        sizeof(opTranspose)));
-    /*
-    DPCT1007:267: Migration of cublasLtMatmulDescSetAttribute is not supported.
-    */
-    cublasCheck(cublasLtMatmulDescSetAttribute(
-        operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose,
-        sizeof(opNoTranspose)));
-    if(has_bias) {
-        /*
-        DPCT1007:268: Migration of cublasLtMatmulDescSetAttribute is not
-        supported.
-        */
-        cublasCheck(cublasLtMatmulDescSetAttribute(
-            operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias,
-            sizeof(epilogueBias)));
-    }
-    /*
-    DPCT1007:269: Migration of cublasLtMatmulDescSetAttribute is not supported.
-    */
-    cublasCheck(cublasLtMatmulDescSetAttribute(
-        operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-
-    // define matrix layouts
-    /*
-    DPCT1007:270: Migration of cublasLtMatrixLayoutCreate is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutCreate(
-        &weightLayout, dpct::library_data_t::real_float, C, OC, C));
-    /*
-    DPCT1007:271: Migration of cublasLtMatrixLayoutCreate is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutCreate(
-        &inputLayout, dpct::library_data_t::real_float, C, B * T, C));
-    /*
-    DPCT1007:272: Migration of cublasLtMatrixLayoutCreate is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutCreate(
-        &outputLayout, dpct::library_data_t::real_float, OC, B * T, OC));
-    /*
-    DPCT1007:273: Migration of cublasLtMatrixLayoutCreate is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutCreate(
-        &biasLayout, dpct::library_data_t::real_float, OC, 1, OC));
-
-    // create a preference handle with specified max workspace
-    /*
-    DPCT1007:274: Migration of cublasLtMatmulPreferenceCreate is not supported.
-    */
-    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
-    /*
-    DPCT1007:275: Migration of cublasLtMatmulPreferenceSetAttribute is not
-    supported.
-    */
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
-
-    // find a suitable algorithm
-    /*
-    DPCT1007:276: Migration of cublasLtMatmulAlgoGetHeuristic is not supported.
-    */
-    cublasCheck(cublasLtMatmulAlgoGetHeuristic(
-        cublaslt_handle, operationDesc, weightLayout, inputLayout, outputLayout,
-        outputLayout, preference, 1, &heuristic, &returnedResults));
-    if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d\n", B, T, C, OC, has_bias);
-        exit(EXIT_FAILURE);
-    }
-
-    // call the matmul
+    // these need to be in FP16 if and only if alpha/beta are CUBLAS_COMPUTE_16F
     const float alpha = 1.0f, beta = 0.0f;
-    /*
-    DPCT1007:277: Migration of cublasLtMatmul is not supported.
-    */
-    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, weight,
-                               weightLayout, inp, inputLayout, &beta, out,
-                               outputLayout, out, outputLayout, &heuristic.algo,
-                               cublaslt_workspace, cublaslt_workspace_size,
-                               &dpct::get_in_order_queue()));
 
-    // cleanups
-    /*
-    DPCT1007:278: Migration of cublasLtMatmulPreferenceDestroy is not supported.
-    */
-    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
-    /*
-    DPCT1007:279: Migration of cublasLtMatmulDescDestroy is not supported.
-    */
-    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
-    /*
-    DPCT1007:280: Migration of cublasLtMatrixLayoutDestroy is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
-    /*
-    DPCT1007:281: Migration of cublasLtMatrixLayoutDestroy is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
-    /*
-    DPCT1007:282: Migration of cublasLtMatrixLayoutDestroy is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
-    /*
-    DPCT1007:283: Migration of cublasLtMatrixLayoutDestroy is not supported.
-    */
-    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
+    int returnedResults = 0;
+    
+    
+    using tag = memory::format_tag;
+    using dt = memory::data_type;
+    dpct::device_ext &dev = dpct::get_current_device();
+    sycl::context ctx = q_ct1.get_context();
+    //auto dev = sycl::device(sycl::gpu_selector_v);
+    //auto ctx = sycl::context(dev);
+     
+    dnnl::engine engine = sycl_interop::make_engine(dev, ctx);
+    // column major 
+    const memory::dims weight_strides = memory::dims {1, C};
+    const auto weight_md = memory::desc({OC, C}, dt::f32, weight_strides);
+    const memory::dims input_strides = memory::dims {C, 1};
+    const auto input_md = memory::desc({C, B * T}, dt::f32, input_strides);
+    const memory::dims output_strides = memory::dims {OC, 1};
+    const auto output_md =  memory::desc({OC, B * T}, dt::f32, output_strides);
+    
+    //memory align
+    memory weight_mem(weight_md, engine);
+    memory input_mem(input_md, engine);
+    memory output_mem(output_md, engine);
+    
+    
+    //create dnnl stream
+    //auto q_ct1 = sycl::queue(ctx, dev);
+    dnnl::stream stream = sycl_interop::make_stream(engine, q_ct1);
+    
+    primitive_attr attr;
+    
+    
+    auto matmul_pd = matmul::primitive_desc(engine, weight_md, input_md, output_md, attr);
+    auto matmul_prim = matmul(matmul_pd);
+    std::unordered_map<int, memory> matmul_args;
+    matmul_args.insert({DNNL_ARG_SRC, weight_mem});
+    matmul_args.insert({DNNL_ARG_WEIGHTS, input_mem});
+    matmul_args.insert({DNNL_ARG_DST, output_mem});
+
+    
+    matmul_prim.execute(stream, matmul_args);
+    stream.wait();
+
+   
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+
 }
 
 void attention_forward(float* out, float* qkvr, float* att,
                        float* inp,
-                       int B, int T, int C, int NH) {
+                       int B, int T, int C, int NH, sycl::queue &q_ct1) {
+try{
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
     const int block_size = 256;
-    const int softmax_block_size = 256;
+    const float alpha = 1.0f, beta = 0.0f;
 
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
@@ -985,205 +846,233 @@ void attention_forward(float* out, float* qkvr, float* att,
     int HS = C / NH; // head size
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
-    float *q, *k, *v;
+    floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    q_ct1.submit(
+		[&](sycl::handler &cgh) {
+    cgh.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             permute_kernel(q, k, v, inp, B, T, NH, HS, item_ct1);
         });
-    /*
-    DPCT1010:284: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+      });
 
-    // batched matrix multiply with cuBLAS
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    float* preatt = inp;
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm_batch(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::trans,
-        oneapi::mkl::transpose::nontrans, T, T, HS, alpha, k, HS, T * HS, q, HS,
-        T * HS, beta, preatt, T, T * T, B * NH)));
-
+    floatX* preatt = inp;
+    
+    dpct::gemm_batch(
+        q_ct1, oneapi::mkl::transpose::trans,
+        oneapi::mkl::transpose::nontrans, T, T, HS, &alpha, k, CUBLAS_LOWP, HS,
+        T * HS, q, CUBLAS_LOWP, HS, T * HS, &beta, preatt, CUBLAS_LOWP, T,
+        T * T, B * NH, cublas_compute);
+     
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
-    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-    dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
+    int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
+    q_ct1.submit([&](sycl::handler &cgh) {
         int B_NH_ct3 = B * NH;
-
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
-                                  sycl::range<3>(1, 1, softmax_block_size),
-                              sycl::range<3>(1, 1, softmax_block_size)),
-            [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
-                softmax_forward_kernel5(att, scale, preatt, B_NH_ct3, T,
-                                        item_ct1);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
+                                               sycl::range<3>(1, 1, block_size),
+                                           sycl::range<3>(1, 1, block_size)),
+                         [=](sycl::nd_item<3> item_ct1)
+                             [[intel::reqd_sub_group_size(32)]] {
+                                 softmax_forward_kernel5(att, scale, preatt,
+                                                         B_NH_ct3, T, item_ct1);
+                             });
     });
-    /*
-    DPCT1010:285: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
 
-    // new approach: first cuBLAS another batched matmul
-    float* vaccum = inp;
+    // new approach: first BLAS another batched matmul
+    floatX* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm_batch(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::nontrans,
-        oneapi::mkl::transpose::nontrans, HS, T, T, alpha, v, HS, T * HS, att,
-        T, T * T, beta, vaccum, HS, T * HS, B * NH)));
-
+    
+    dpct::gemm_batch(
+        q_ct1, oneapi::mkl::transpose::nontrans,
+        oneapi::mkl::transpose::nontrans, HS, T, T, &alpha, v, CUBLAS_LOWP, HS,
+        T * HS, att, CUBLAS_LOWP, T, T * T, &beta, vaccum, CUBLAS_LOWP, HS,
+        T * HS, B * NH, cublas_compute);
+     
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    q_ct1.submit(
+		[&](sycl::handler &cgh) {
+    cgh.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             unpermute_kernel(vaccum, out, B, T, NH, HS, item_ct1);
         });
-    /*
-    DPCT1010:286: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+      });
+    }
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+  
 }
 
-void residual_forward(float* out, float* inp1, float* inp2, int N) {
+void residual_forward(float* out, float* inp1, float* inp2, int N, sycl::queue &q) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    q.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             residual_forward_kernel(out, inp1, inp2, N, item_ct1);
         });
-    /*
-    DPCT1010:287: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
 }
 
-void gelu_forward(float* out, const float* inp, int N) {
+void gelu_forward(float* out, const float* inp, int N, sycl::queue &q) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    q.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             gelu_forward_kernel(out, inp, N, item_ct1);
         });
-    /*
-    DPCT1010:288: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+   
 }
 
-void gelu_backward(float* dinp, const float* inp, const float* dout, const int N) {
+void gelu_backward(float* dinp, const float* inp, const float* dout, const int N, sycl::queue &q) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    q.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             gelu_backward_kernel(dinp, inp, dout, N, item_ct1);
         });
-    /*
-    DPCT1010:289: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
 }
 
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      float* dout, float* inp, float* weight,
-                     int B, int T, int C, int OC) {
-    float one = 1.0f;
-    float zero = 0.0f;
-    // backward to input, uses = in the backward pass (set the gradient)
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::nontrans,
-        oneapi::mkl::transpose::nontrans, C, B * T, OC,
-        dpct::get_value(&one, cublas_handle->get_queue()), weight, C, dout, OC,
-        dpct::get_value(&zero, cublas_handle->get_queue()), dinp, C)));
-    // backward to weight, uses += in the backward pass (accumulate the gradient)
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::nontrans,
-        oneapi::mkl::transpose::trans, C, OC, B * T,
-        dpct::get_value(&one, cublas_handle->get_queue()), inp, C, dout, OC,
-        dpct::get_value(&one, cublas_handle->get_queue()), dweight, C)));
+                     int B, int T, int C, int , sycl::queue &q) {
+// Fix - to do
+try{
+    dpct::device_info deviceProp;
+    float one = 1.0f, zero = 0.0f;
+
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        const int block_size = 1024;
-        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
-        /*
-        DPCT1049:23: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
-            /*
-            DPCT1083:543: The size of local memory in the migrated code may be
-            different from the original code. Check that the allocated memory
-            size in the migrated code is correct.
-            */
-            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                sycl::range<1>(block_size * sizeof(float)), cgh);
+        // Each warp is responsible for 8 * "x128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
+        // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
 
-            cgh.parallel_for(
-                sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
-                                      sycl::range<3>(1, 1, block_size),
-                                  sycl::range<3>(1, 1, block_size)),
+        const int block_size =
+            deviceProp.get_max_work_items_per_compute_unit() == 1536 ? 768
+                                                                     : 1024;
+
+        sycl::range<3> block_dim = {(unsigned)block_size / WARP_SIZE, 8, 4};
+        const int OC_per_warp = block_dim[1] * x128::size; // 64 at BF16
+        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
+        const int grid_size_y =
+            std::max(1, deviceProp.get_max_work_items_per_compute_unit() *
+                            deviceProp.get_max_compute_units() /
+                            (block_size * grid_size_x)); // full GPU!
+
+        // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
+        // and write results directly to the output.
+        if(grid_size_y == 1) {
+            
+            
+            q.submit([&](sycl::handler &cgh) {
+                
+                sycl::local_accessor<float, 3> sub_results_acc_ct1(
+                    sycl::range<3>(8 /*x128::size*/, 32 /*WARP_SIZE*/,
+                                   8 /*bdy*/),
+                    cgh);
+
+                cgh.parallel_for(
+                    sycl::nd_range<3>(
+                        sycl::range<3>(1, grid_size_y, grid_size_x) * block_dim,
+                        block_dim),
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[intel::reqd_sub_group_size(32)]] {
+                            matmul_backward_bias_kernel9(
+                                dbias, dout, B, T, OC,
+                                std::bool_constant<false>{}, item_ct1,
+                                sub_results_acc_ct1);
+                        });
+            });
+           
+        } else {
+            // kernel 9 overwrites temp buffer, so no need to memset
+            
+            q.submit([&](sycl::handler &cgh) {
+                
+                sycl::local_accessor<float, 3> sub_results_acc_ct1(
+                    sycl::range<3>(8 /*x128::size*/, 32 /*WARP_SIZE*/,
+                                   8 /*bdy*/),
+                    cgh);
+
+                cgh.parallel_for(
+                    sycl::nd_range<3>(
+                        sycl::range<3>(1, grid_size_y, grid_size_x) * block_dim,
+                        block_dim),
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[intel::reqd_sub_group_size(32)]] {
+                            matmul_backward_bias_kernel9(
+                                dbias_buffer, dout, B, T, OC,
+                                std::bool_constant<true>{}, item_ct1,
+                                sub_results_acc_ct1);
+                        });
+            });
+            
+            
+            dpct::get_in_order_queue().parallel_for(
+                sycl::nd_range<3>(
+                    sycl::range<3>(1, 1, CEIL_DIV(OC, 256 * f128::size)) *
+                        sycl::range<3>(1, 1, 256),
+                    sycl::range<3>(1, 1, 256)),
                 [=](sycl::nd_item<3> item_ct1) {
-                    matmul_backward_bias_kernel4(
-                        dbias, dout, B, T, OC, item_ct1,
-                        dpct_local_acc_ct1
-                            .get_multi_ptr<sycl::access::decorated::no>()
-                            .get());
+                    reduce_add_sum_kernel(dbias, dbias_buffer, OC, grid_size_y,
+                                          item_ct1);
                 });
-        });
-        /*
-        DPCT1010:290: SYCL uses exceptions to report errors and does not use the
-        error codes. The call was replaced with 0. You need to rewrite this
-        code.
-        */
-        cudaCheck(0);
+            
+        }
     }
+
+    // backward to input, uses = in the backward pass (set the gradient)
+    
+        dpct::gemm(q, oneapi::mkl::transpose::nontrans,
+                   oneapi::mkl::transpose::nontrans, C, B * T, OC, &one, weight,
+                   CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero, dinp,
+                   CUBLAS_LOWP, C, cublas_compute);
+    // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
+    dpct::gemm(
+        q, oneapi::mkl::transpose::nontrans,
+        oneapi::mkl::transpose::trans, C, OC, B * T, &one, inp, CUBLAS_LOWP, C,
+        dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, cublas_compute);
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 }
 
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
                         const float* dout, const float* inp, const  float* weight, const float* mean, const float* rstd,
-                        int B, int T, int C) {
+                        int B, int T, int C, sycl::queue &q) {
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = CEIL_DIV(32*N, block_size);
-    /*
-    DPCT1083:25: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
+    
     size_t shared_mem_size = 2 * C * sizeof(float);
-    /*
-    DPCT1049:24: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
+    
+    q.submit([&](sycl::handler &cgh) {
         sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
             sycl::range<1>(shared_mem_size), cgh);
 
@@ -1200,11 +1089,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
                         .get());
             });
     });
-    /*
-    DPCT1010:291: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+   
 }
 
 // the sequence of transformations in this compound op is:
@@ -1212,50 +1097,55 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
                         const float* dout,
                         const float* qkvr, const float* att,
-                        int B, int T, int C, int NH) {
+                        int B, int T, int C, int NH, sycl::queue &q_ct1) {
+try{
     const int block_size = 256;
     int HS = C / NH; // head size
-    const float one = 1.0f;
-    const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    const float alpha = 1.0f, beta = 0.0f;
+
     // unpack convenience pointers into q, k, v
-    const float *q, *k, *v;
+    const floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
-    float *dq, *dk, *dv;
+    floatX *dq, *dk, *dv;
     dq = dqkvr + 0 * B * T * C;
     dk = dqkvr + 1 * B * T * C;
     dv = dqkvr + 2 * B * T * C;
+
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    q_ct1.submit(
+		[&](sycl::handler &cgh) {
+    cgh.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             unpermute_kernel_backward(scratch, dout, B, T, NH, HS, item_ct1);
         });
-    /*
-    DPCT1010:292: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    });
     // backward into datt
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm_batch(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::trans,
-        oneapi::mkl::transpose::nontrans, T, T, HS, one, v, HS, T * HS, scratch,
-        HS, T * HS, zero, datt, T, T * T, B * NH)));
+    
+    dpct::gemm_batch(
+        q_ct1, oneapi::mkl::transpose::trans,
+        oneapi::mkl::transpose::nontrans, T, T, HS, &alpha, v, CUBLAS_LOWP, HS,
+        T * HS, scratch, CUBLAS_LOWP, HS, T * HS, &beta, datt, CUBLAS_LOWP, T,
+        T * T, B * NH, cublas_compute);
     // backward into dv
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm_batch(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::nontrans,
-        oneapi::mkl::transpose::trans, HS, T, T, one, scratch, HS, T * HS, att,
-        T, T * T, zero, dv, HS, T * HS, B * NH)));
+    dpct::gemm_batch(
+        q_ct1, oneapi::mkl::transpose::nontrans,
+        oneapi::mkl::transpose::trans, HS, T, T, &alpha, scratch, CUBLAS_LOWP,
+        HS, T * HS, att, CUBLAS_LOWP, T, T * T, &beta, dv, CUBLAS_LOWP, HS,
+        T * HS, B * NH, cublas_compute);
+    
     // backward into preatt
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
-        sycl::local_accessor<float, 1> block_acc_acc_ct1(sycl::range<1>(32),
-                                                         cgh);
+    
+    q_ct1.submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<float, 1> shared_val_acc_ct1(
+            sycl::range<1>(32 /*WARP_SIZE*/), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, B * NH, T / 4) *
@@ -1264,55 +1154,54 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
             [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
                 softmax_autoregressive_backward_kernel(
                     dpreatt, datt, att, B, T, C, scale, item_ct1,
-                    block_acc_acc_ct1
+                    shared_val_acc_ct1
                         .get_multi_ptr<sycl::access::decorated::no>()
                         .get());
             });
     });
-    /*
-    DPCT1010:293: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
     // backward into q
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm_batch(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::nontrans,
-        oneapi::mkl::transpose::nontrans, HS, T, T, one, k, HS, T * HS, dpreatt,
-        T, T * T, zero, dq, HS, T * HS, B * NH)));
+    
+   dpct::gemm_batch(
+        q_ct1, oneapi::mkl::transpose::nontrans,
+        oneapi::mkl::transpose::nontrans, HS, T, T, &alpha, k, CUBLAS_LOWP, HS,
+        T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta, dq, CUBLAS_LOWP, HS,
+        T * HS, B * NH, cublas_compute);
     // backward into k
-    cublasCheck(DPCT_CHECK_ERROR(oneapi::mkl::blas::column_major::gemm_batch(
-        cublas_handle->get_queue(), oneapi::mkl::transpose::nontrans,
-        oneapi::mkl::transpose::trans, HS, T, T, one, q, HS, T * HS, dpreatt, T,
-        T * T, zero, dk, HS, T * HS, B * NH)));
+    dpct::gemm_batch(
+        q_ct1, oneapi::mkl::transpose::nontrans,
+        oneapi::mkl::transpose::trans, HS, T, T, &alpha, q, CUBLAS_LOWP, HS,
+        T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta, dk, CUBLAS_LOWP, HS,
+        T * HS, B * NH, cublas_compute);
     // backward into inp
+    
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    dpct::get_in_order_queue().parallel_for(
+    q_ct1.submit([&](sycl::handler &cgh) {
+      cgh.parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) *
                               sycl::range<3>(1, 1, block_size),
                           sycl::range<3>(1, 1, block_size)),
         [=](sycl::nd_item<3> item_ct1) {
             permute_kernel_backward(dinp, dq, dk, dv, B, T, NH, HS, item_ct1);
         });
-    /*
-    DPCT1010:294: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+      });
+    }
+    
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
 }
 
 // replaces logits with logit gradients
 void fused_classifier3(float* logits, float* losses,
                       const float* dlosses, const int* targets,
-                      int B, int T, int V, int P) {
+                      int B, int T, int V, int P, sycl::queue &q) {
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    /*
-    DPCT1049:26: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
+    
+    q.submit([&](sycl::handler &cgh) {
         sycl::local_accessor<float, 1> shared_maxval_acc_ct1(sycl::range<1>(32),
                                                              cgh);
         sycl::local_accessor<float, 1> shared_sumval_acc_ct1(sycl::range<1>(32),
@@ -1334,11 +1223,7 @@ void fused_classifier3(float* logits, float* losses,
                         .get());
             });
     });
-    /*
-    DPCT1010:295: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
 }
 
 // ----------------------------------------------------------------------------
@@ -1398,7 +1283,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes, int on_device) {
+float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes, int on_device, sycl::queue &q) {
     // on_device: 0 = CPU, 1 = GPU
     // calculate the number of parameters
     size_t num_parameters = 0;
@@ -1408,14 +1293,9 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     // malloc all parameters all at once on the device
     float* params_memory;
     if (on_device) {
-        /*
-        DPCT1064:529: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(
-            DPCT_CHECK_ERROR(params_memory = sycl::malloc_device<float>(
-                                 num_parameters, dpct::get_in_order_queue())));
+        
+        params_memory = sycl::malloc_device<float>(
+                                 num_parameters, q);
     } else {
         params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     }
@@ -1514,20 +1394,14 @@ void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) 
 }
 
 
-float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
+float* malloc_and_point(float** targets[], const size_t* act_sizes, int n, sycl::queue &q) {
     size_t num_activations = 0;
     for (size_t i = 0; i < n; i++) {
         num_activations += act_sizes[i];
     }
     float* acts_memory;
-    /*
-    DPCT1064:530: Migrated cudaMalloc call is used in a macro/template
-    definition and may not be valid for all macro/template uses. Adjust the
-    code.
-    */
-    cudaCheck(
-        DPCT_CHECK_ERROR(acts_memory = sycl::malloc_device<float>(
-                             num_activations, dpct::get_in_order_queue())));
+    acts_memory = sycl::malloc_device<float>(
+                             num_activations, q);
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < n; i++) {
         *(targets[i]) = acts_memory_iterator;
@@ -1536,21 +1410,21 @@ float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
     return acts_memory;
 }
 
-float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
+float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes, sycl::queue &q) {
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
     };
-    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
+    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS, q);
 }
 
-float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
+float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes, sycl::queue &q) {
     float** ptrs[] = {
         &acts->bt4c, &acts->preatt, &acts->residual3
     };
-    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
+    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS, q);
 }
 
 typedef struct dpct_type_166660 {
@@ -1584,7 +1458,7 @@ typedef struct dpct_type_166660 {
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
 } GPT2;
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, sycl::queue &q) {
 
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
@@ -1617,16 +1491,14 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->num_parameters = num_parameters;
 
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1, q);
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
     freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    cudaCheck(
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(model->params_memory, params_memory_cpu,
+    q.memcpy(model->params_memory, params_memory_cpu,
                                      num_parameters * sizeof(float))
-                             .wait()));
+                             .wait();
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
@@ -1644,7 +1516,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T, sycl::queue &q) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -1680,30 +1552,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
             num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
-        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes, q);
         printf("allocated %zu MiB for activations\n", (num_activations * sizeof(float)) >> 20); // >> 20 is /(1024*1024)
         // also create memory for caching inputs and targets
-        /*
-        DPCT1064:531: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(model->inputs = sycl::malloc_device<int>(
-                                       B * T, dpct::get_in_order_queue())));
-        /*
-        DPCT1064:532: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(model->targets = sycl::malloc_device<int>(
-                                       B * T, dpct::get_in_order_queue())));
-        /*
-        DPCT1064:533: Migrated cudaMallocHost call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(model->cpu_losses = sycl::malloc_host<float>(
-                                       B * T, dpct::get_in_order_queue())));
+        model->inputs = sycl::malloc_device<int>(
+                                       B * T, q);
+        model->targets = sycl::malloc_device<int>(
+                                       B * T, q);
+        model->cpu_losses = sycl::malloc_host<float>(
+                                       B * T, q);
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -1714,22 +1571,18 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // copy inputs/targets to the model
-    cudaCheck(
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(model->inputs, inputs, B * T * sizeof(int))
-                             .wait()));
+    q.memcpy(model->inputs, inputs, B * T * sizeof(int))
+                             .wait();
     if (targets != NULL) {
-        cudaCheck(DPCT_CHECK_ERROR(
-            dpct::get_in_order_queue()
-                .memcpy(model->targets, targets, B * T * sizeof(int))
-                .wait()));
+        q.memcpy(model->targets, targets, B * T * sizeof(int))
+                .wait();
     }
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, q); // encoding goes into residual[0]
 
     for (int l = 0; l < L; l++) {
 
@@ -1770,33 +1623,31 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* scratch = acts.output;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
-        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, q);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, q);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, q);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, q);
+        residual_forward(l_residual2, residual, l_attproj, B*T*C, q);
+        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, q);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, q);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, q);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, q);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C, q);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C, q);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, q);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
+        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp, q);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
-        cudaCheck(DPCT_CHECK_ERROR(
-            dpct::get_in_order_queue()
-                .memcpy(model->cpu_losses, acts.losses, B * T * sizeof(float))
-                .wait()));
+       q.memcpy(model->cpu_losses, acts.losses, B * T * sizeof(float))
+                .wait();
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
         mean_loss /= B*T;
@@ -1808,24 +1659,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 }
 
-void gpt2_zero_grad(GPT2 *model) {
+void gpt2_zero_grad(GPT2 *model, sycl::queue &q) {
     if (model->grads_acts_memory != NULL) {
-        cudaCheck(
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memset(model->grads_acts_memory, 0,
+        q.memset(model->grads_acts_memory, 0,
                                          model->num_grad_acts * sizeof(float))
-                                 .wait()));
+                                 .wait();
     }
     if (model->grads_memory != NULL) {
-        cudaCheck(
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memset(model->grads_memory, 0,
+        q.memset(model->grads_memory, 0,
                                          model->num_parameters * sizeof(float))
-                                 .wait()));
+                                 .wait();
     }
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model, sycl::queue &q) {
 
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -1836,7 +1683,7 @@ void gpt2_backward(GPT2 *model) {
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1, q);
         printf("allocated %zu MiB for parameter gradients\n", (model->num_parameters * sizeof(float)) >> 20);
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass acrtivations and we will save memory.
@@ -1845,14 +1692,14 @@ void gpt2_backward(GPT2 *model) {
         cfg.num_layers = 1; // copy the configuration but override number of layers to 1
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
         // count up and allocate the space
-        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
+        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes, q);
         model->num_grad_acts = 0;
         for (int i = 0; i < NUM_BACKWARD_TENSORS; i++) {
             model->num_grad_acts += bw_act_sizes[i];
         }
         printf("allocated %zu MiB for activation gradients\n", (model->num_grad_acts * sizeof(float)) >> 20);
         // init gradients of parameters and activations to zero
-        gpt2_zero_grad(model);
+        gpt2_zero_grad(model, q);
     }
 
     // convenience shortcuts
@@ -1874,11 +1721,11 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp, q);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, q);
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
@@ -1931,55 +1778,39 @@ void gpt2_backward(GPT2 *model) {
         float* scratch = acts.output;
 
         // backprop this layer
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C, q);
+        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C, q);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C, q);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, q);
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C, q);
         // we more B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         float* buffer_a = l_atty;
         float* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, q);
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C, q);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, q);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, q);
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, sycl::queue &q) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        /*
-        DPCT1064:534: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(
+        
             model->m_memory = sycl::malloc_device<float>(
-                model->num_parameters, dpct::get_in_order_queue())));
-        /*
-        DPCT1064:535: Migrated cudaMalloc call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
-        cudaCheck(DPCT_CHECK_ERROR(
+                model->num_parameters, q);
+        
             model->v_memory = sycl::malloc_device<float>(
-                model->num_parameters, dpct::get_in_order_queue())));
-        cudaCheck(
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memset(model->m_memory, 0,
-                                         model->num_parameters * sizeof(float))
-                                 .wait()));
-        cudaCheck(
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memset(model->v_memory, 0,
-                                         model->num_parameters * sizeof(float))
-                                 .wait()));
+                model->num_parameters, q);
+        q.memset(model->m_memory, 0, model->num_parameters * sizeof(float))
+                                 .wait();
+        q.memset(model->v_memory, 0, model->num_parameters * sizeof(float))
+                                 .wait();
         printf("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
         printf("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
     }
@@ -1988,12 +1819,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    /*
-    DPCT1049:27: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
+    
+    q.submit([&](sycl::handler &cgh) {
         float *model_params_memory_ct0 = model->params_memory;
         float *model_grads_memory_ct1 = model->grads_memory;
         float *model_m_memory_ct2 = model->m_memory;
@@ -2012,31 +1839,19 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                  beta2_correction, eps, weight_decay, item_ct1);
                          });
     });
-    /*
-    DPCT1010:296: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    cudaCheck(0);
+    
 }
 
-void gpt2_free(GPT2 *model) {
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->params_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->grads_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->m_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->v_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->acts_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->grads_acts_memory, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->inputs, dpct::get_in_order_queue())));
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(model->targets, dpct::get_in_order_queue())));
-    sycl::free(model->cpu_losses, dpct::get_in_order_queue());
+void gpt2_free(GPT2 *model, sycl::queue &q) {
+    sycl::free(model->params_memory, q);
+    sycl::free(model->grads_memory, q);
+    sycl::free(model->m_memory, q);
+    sycl::free(model->v_memory, q);
+    sycl::free(model->acts_memory, q);
+    sycl::free(model->grads_acts_memory, q);
+    sycl::free(model->inputs, q);
+    sycl::free(model->targets, q);
+    sycl::free(model->cpu_losses, q);
 }
 
 #ifndef TESTING
@@ -2130,6 +1945,14 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
 
+    auto ekind = engine::kind::cpu;
+        
+    sycl::queue q = (ekind == engine::kind::gpu)
+            ? sycl::queue(
+                    sycl::gpu_selector_v, sycl::property::queue::in_order {})
+            : sycl::queue(
+                    sycl::cpu_selector_v, sycl::property::queue::in_order {});
+                    
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -2175,44 +1998,23 @@ int main(int argc, char *argv[]) {
 
     // set up the device
     int deviceIdx = 0;
-    /*
-    DPCT1093:297: The "deviceIdx" device may be not the one intended for use.
-    Adjust the selected device if needed.
-    */
-    cudaCheck(DPCT_CHECK_ERROR(dpct::select_device(deviceIdx)));
+    
     dpct::device_info deviceProp;
-    dpct::get_device_info(deviceProp,
-                          dpct::dev_mgr::instance().get_device(deviceIdx));
-    // setup cuBLAS and cuBLASLt
-    cublasCheck(DPCT_CHECK_ERROR(cublas_handle = new dpct::blas::descriptor()));
-    /*
-    DPCT1007:298: Migration of cublasLtCreate is not supported.
-    */
-    cublasCheck(cublasLtCreate(&cublaslt_handle));
+    
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    /*
-    DPCT1005:299: The SYCL device version is different from CUDA Compute
-    Compatibility. You may need to rewrite this code.
-    */
+    
     int enable_tf32 = deviceProp.get_major_version() >= 8 ? 1 : 0;
-    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    int cublas_math_mode =
-        enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
-    /*
-    DPCT1027:300: The call to cublasSetMathMode was replaced with 0 because this
-    functionality is redundant in SYCL.
-    */
-    cublasCheck(0);
-    cudaCheck(DPCT_CHECK_ERROR(
-        cublaslt_workspace = (void *)sycl::malloc_device(
-            cublaslt_workspace_size, dpct::get_in_order_queue())));
+    cublas_compute =  CUBLAS_COMPUTE_32F;
+    
+    cublaslt_workspace = (void *)sycl::malloc_device(
+            cublaslt_workspace_size, q);
     printf("| device                | %-50s |\n", deviceProp.get_name());
     printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin", q);
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
@@ -2261,7 +2063,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T, q);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -2282,18 +2084,16 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_forward(&model, gen_tokens, NULL, B, T, q);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
                 float* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                cudaCheck(DPCT_CHECK_ERROR(
-                    dpct::get_in_order_queue()
-                        .memcpy(cpu_logits, logits,
+                q.memcpy(cpu_logits, logits,
                                 model.config.vocab_size * sizeof(float))
-                        .wait()));
+                        .wait();
                 float coin = random_f32(&rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
@@ -2319,13 +2119,11 @@ int main(int argc, char *argv[]) {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model);
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-        cudaCheck(DPCT_CHECK_ERROR(
-            dpct::get_current_device()
-                .queues_wait_and_throw())); // finish all CUDA work to get
+        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, q);
+        gpt2_zero_grad(&model, q);
+        gpt2_backward(&model, q);
+        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, q);
+        q.wait_and_throw(); // finish all SYCL work to get
                                             // correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -2341,16 +2139,11 @@ int main(int argc, char *argv[]) {
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
-    gpt2_free(&model);
+    gpt2_free(&model, q);
     free(cpu_logits);
     free(gen_tokens);
-    cudaCheck(DPCT_CHECK_ERROR(
-        dpct::dpct_free(cublaslt_workspace, dpct::get_in_order_queue())));
-    cublasCheck(DPCT_CHECK_ERROR(delete (cublas_handle)));
-    /*
-    DPCT1007:301: Migration of cublasLtDestroy is not supported.
-    */
-    cublasCheck(cublasLtDestroy(cublaslt_handle));
+    sycl::free(cublaslt_workspace, q);
+    
     logger_free(&logger);
 
     return 0;

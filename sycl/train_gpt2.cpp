@@ -648,7 +648,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, sycl::
     void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
     freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
     q.memcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes).wait();
-    free(params_memory_cpu, q);
+    free(params_memory_cpu);
     fcloseCheck(model_file);
 
     gpt2_init_common(model);
@@ -1431,7 +1431,7 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader,
                                            shard_num_parameters * sizeof(float))
                                    .wait();
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    free(cpu_buffer, q);
+    free(cpu_buffer);
     fclose(state_file);
 }
 
@@ -1466,7 +1466,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     q.memcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float))
                                    .wait();
-    free(cpu_buffer, q);
+    free(cpu_buffer);
     fclose(state_file);
 }
 
@@ -1969,9 +1969,9 @@ int main(int argc, char *argv[]) {
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
-    free(cpu_logits_raw, q);
-    free(cpu_logits, q);
-    free(gen_tokens, q);
+    free(cpu_logits_raw);
+    free(cpu_logits);
+    free(gen_tokens);
     multi_gpu_config_free(&multi_gpu_config);
     gpt2_free(&model, q);
     common_free(model, q);
