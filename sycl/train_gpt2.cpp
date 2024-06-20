@@ -37,14 +37,14 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/mfu.h"
 // ----------- GPU utilities -----------
 // defines:
-// WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
+// WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV,  PRECISION_MODE
 // NVTX_RANGE_FN
 #include "llmc/sycl_common.h"
 // defines:
 // Packed128, f128, x128
 // warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel
 #include "llmc/sycl_utils.h"
-// ----------- Layer implementations in CUDA -----------
+// ----------- Layer implementations in SYCL -----------
 // defines: encoder_forward, encoder_backward
 #include "llmc/encoder.h"
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
@@ -52,7 +52,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: gelu_forward, gelu_backward_inplace
 #include "llmc/gelu.h"
 #ifdef ENABLE_DNN
-// defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
+// defines: create_dnn, destroy_dnn, attention_forward_dnn, attention_backward_dnn
 #include "llmc/dnn_att.h"
 #else
 // defines: attention_forward, attention_backward
@@ -183,6 +183,7 @@ int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
 MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
 #ifdef MULTI_GPU
     // Initialize MPI.
+    /*
     MultiGpuConfig result;
     mpiCheck(MPI_Init(argc, argv));
     mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
@@ -196,13 +197,12 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
     return result;
+    */
+    return NULL;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
-    /*
-    DPCT1093:246: The "0" device may be not the one intended for use. Adjust the
-    selected device if needed.
-    */
-    cudaCheck(DPCT_CHECK_ERROR(dpct::select_device(0)));
+    
+    dpct::select_device(0);
     MultiGpuConfig result;
     result.process_rank = 0;
     result.num_processes = 1;
@@ -359,7 +359,7 @@ typedef struct dpct_type_471827 {
     floatX* ln1_mean; // (L, B, T)
     floatX* ln1_rstd; // (L, B, T)
     floatX* atty; // (L, B, T, C)
-    floatX* att; // (L, B, NH, T, T) (smaller with cuDNN)
+    floatX* att; // (L, B, NH, T, T) (smaller with DNN)
     floatX* attproj; // (L, B, T, C)
     floatX* residual2; // (L, B, T, C)
     floatX* ln2; // (L, B, T, C)
@@ -394,8 +394,8 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
-    #ifdef ENABLE_CUDNN
-    // FP32 stats tensor for cuDNN to be passed to backward pass
+    #ifdef ENABLE_DNN
+    // FP32 stats tensor for DNN to be passed to backward pass
     act_sizes[5] = L * B * NH * T * (sizeof(float) / sizeof(floatX));
     #else
     act_sizes[5] = L * B * NH * T * T; // att
@@ -423,7 +423,7 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#ifdef ENABLE_CUDNN
+#ifdef ENABLE_DNN
 #define NUM_BACKWARD_TENSORS 2
 #else
 #define NUM_BACKWARD_TENSORS 3
@@ -432,7 +432,7 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
 typedef struct dpct_type_173598 {
     floatX* bt4c; // (B, T, 4*C)
     floatX* residual3; // (B, T, C)
-    #ifndef ENABLE_CUDNN
+    #ifndef ENABLE_DNN
     floatX* preatt; // (B, NH, T, T)
     #endif
 } GradActTensors;
@@ -442,7 +442,7 @@ void fill_in_grad_act_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config co
     act_sizes[0] = B * T * 4 * C; // bt4c
     act_sizes[1] = B * T * C; // residual3
 
-    #ifndef ENABLE_CUDNN
+    #ifndef ENABLE_DNN
     size_t NH = config.num_heads;
     act_sizes[2] = B * NH * T * T; // preatt
     #endif
@@ -521,7 +521,7 @@ typedef struct dpct_type_700314 {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
-    floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with MallocHost
     float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights; // keep master weights copy in float for optim update? 0|1
@@ -859,9 +859,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
 
         // now do the forward pass
         #ifdef ENABLE_DNN
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
+        float* l_att = (float*)acts.att + l * B * NH * T; // DNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, q);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, q, ekind);
+        attention_forward_dnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, q, ekind);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
@@ -1059,8 +1059,8 @@ void gpt2_backward(GPT2 *model, int* inputs, sycl::queue &q) {
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, q);
 
         #ifdef ENABLE_DNN // dnn backward is not added
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        //attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C); //to-do
+        float* l_att = (float*)acts.att + l * B * NH * T; // DNN needs a smaller FP32 tensor
+        //attention_backward_dnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C); //to-do
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
@@ -1383,7 +1383,7 @@ void common_start(bool override_enable_tf32, bool print_device_info, sycl::queue
     cublas_compute = CUBLAS_COMPUTE_32F;
 
     #ifdef ENABLE_DNN
-    create_cudnn();
+    create_dnn();
     #endif
 }
 
@@ -1391,7 +1391,7 @@ void common_free(GPT2 &model, sycl::queue &q) {
     sycl::free(cublaslt_workspace, q);
     
 #ifdef ENABLE_DNN
-    destroy_cudnn();
+    destroy_dnn();
     #endif
 }
 
@@ -1516,7 +1516,7 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
     
-    auto ekind = engine::kind::gpu;
+    auto ekind = engine::kind::cpu;
         
     sycl::queue q = (ekind == engine::kind::gpu)
             ? sycl::queue(
@@ -1942,7 +1942,7 @@ int main(int argc, char *argv[]) {
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
         float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
         float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
-        if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
+        if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/DNN initialisation)
             total_sum_iteration_time_s += time_elapsed_ms / 1000.0f;
             // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;

@@ -1,8 +1,8 @@
 /*
 cuDNN (flash) attention
 */
-#ifndef CUDNN_ATT_H
-#define CUDNN_ATT_H
+#ifndef DNN_ATT_H
+#define DNN_ATT_H
 
 #include "sycl_common.h"
 #include <sycl/sycl.hpp>
@@ -110,4 +110,4 @@ void allocate_sycl_graph_mem(std::vector<dnnl::graph::tensor> &tensors,
     }
 }
 
-#endif // CUDNN_ATT_H
+#endif // DNN_ATT_H
