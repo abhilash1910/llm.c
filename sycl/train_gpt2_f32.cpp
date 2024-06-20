@@ -29,6 +29,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 #include "llmc/sycl_utils.h"
 #include "llmc/sycl_common.h"
+#include <oneapi/mkl.hpp>
 
 // GPU / CUDA related
 // our own utilities
@@ -958,102 +959,44 @@ void gelu_backward(float* dinp, const float* inp, const float* dout, const int N
 
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      float* dout, float* inp, float* weight,
-                     int B, int T, int C, int , sycl::queue &q) {
+                     int B, int T, int C, int OC, sycl::queue &q) {
 // Fix - to do
 try{
     dpct::device_info deviceProp;
     float one = 1.0f, zero = 0.0f;
 
-    // backward to bias, if given, does a +=
+    // backward to input
+    oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+                            C, B * T, OC, one, weight, C, dout, OC, zero, dinp, C).wait();
+    // backward to weight
+    oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+                            C, OC, B * T, one, inp, C, dout, OC, zero, dweight, C).wait();
+
+
+    // backward to bias, 
     if (dbias != NULL) {
-        // Each warp is responsible for 8 * "x128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
-        // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
-
-        const int block_size =
-            deviceProp.get_max_work_items_per_compute_unit() == 1536 ? 768
-                                                                     : 1024;
-
-        sycl::range<3> block_dim = {(unsigned)block_size / WARP_SIZE, 8, 4};
-        const int OC_per_warp = block_dim[1] * x128::size; // 64 at BF16
-        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
-        const int grid_size_y =
-            std::max(1, deviceProp.get_max_work_items_per_compute_unit() *
-                            deviceProp.get_max_compute_units() /
-                            (block_size * grid_size_x)); // full GPU!
-
-        // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
-        // and write results directly to the output.
-        if(grid_size_y == 1) {
-            
-            
-            q.submit([&](sycl::handler &cgh) {
-                
-                sycl::local_accessor<float, 3> sub_results_acc_ct1(
-                    sycl::range<3>(8 /*x128::size*/, 32 /*WARP_SIZE*/,
-                                   8 /*bdy*/),
-                    cgh);
-
-                cgh.parallel_for(
-                    sycl::nd_range<3>(
-                        sycl::range<3>(1, grid_size_y, grid_size_x) * block_dim,
-                        block_dim),
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[intel::reqd_sub_group_size(32)]] {
-                            matmul_backward_bias_kernel9(
-                                dbias, dout, B, T, OC,
-                                std::bool_constant<false>{}, item_ct1,
-                                sub_results_acc_ct1);
-                        });
-            });
-           
-        } else {
-            // kernel 9 overwrites temp buffer, so no need to memset
-            
-            q.submit([&](sycl::handler &cgh) {
-                
-                sycl::local_accessor<float, 3> sub_results_acc_ct1(
-                    sycl::range<3>(8 /*x128::size*/, 32 /*WARP_SIZE*/,
-                                   8 /*bdy*/),
-                    cgh);
-
-                cgh.parallel_for(
-                    sycl::nd_range<3>(
-                        sycl::range<3>(1, grid_size_y, grid_size_x) * block_dim,
-                        block_dim),
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[intel::reqd_sub_group_size(32)]] {
-                            matmul_backward_bias_kernel9(
-                                dbias_buffer, dout, B, T, OC,
-                                std::bool_constant<true>{}, item_ct1,
-                                sub_results_acc_ct1);
-                        });
-            });
-            
-            
-            dpct::get_in_order_queue().parallel_for(
-                sycl::nd_range<3>(
-                    sycl::range<3>(1, 1, CEIL_DIV(OC, 256 * f128::size)) *
-                        sycl::range<3>(1, 1, 256),
-                    sycl::range<3>(1, 1, 256)),
-                [=](sycl::nd_item<3> item_ct1) {
-                    reduce_add_sum_kernel(dbias, dbias_buffer, OC, grid_size_y,
-                                          item_ct1);
-                });
-            
-        }
-    }
-
-    // backward to input, uses = in the backward pass (set the gradient)
-    
-        dpct::gemm(q, oneapi::mkl::transpose::nontrans,
-                   oneapi::mkl::transpose::nontrans, C, B * T, OC, &one, weight,
-                   CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero, dinp,
-                   CUBLAS_LOWP, C, cublas_compute);
-    // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
-    dpct::gemm(
-        q, oneapi::mkl::transpose::nontrans,
-        oneapi::mkl::transpose::trans, C, OC, B * T, &one, inp, CUBLAS_LOWP, C,
-        dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, cublas_compute);
+        const int block_size = 1024;
+        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
+        q.submit([&](sycl::handler &cgh){
+        
+          sycl::local_accessor<uint8_t, 3> smem_results_acc_ct1(sycl::range<3>(8 /*x128::size*/, 32 /*WARP_SIZE*/,
+                                   8 /*bdy*/), cgh);
+                                   
+          cgh.parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, grid_size) *
+                                  sycl::range<3>(1, 1, block_size),
+                              sycl::range<3>(1, 1, block_size)),
+            [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
+                matmul_backward_bias_kernel4(
+                    dbias, dout, B, T, OC, item_ct1,
+                    smem_results_acc_ct1.get_pointer());
+            }); 
+        
+        
+        
+        });
+        
+       }
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -1126,7 +1069,6 @@ try{
         });
     });
     // backward into datt
-    
     dpct::gemm_batch(
         q_ct1, oneapi::mkl::transpose::trans,
         oneapi::mkl::transpose::nontrans, T, T, HS, &alpha, v, CUBLAS_LOWP, HS,
