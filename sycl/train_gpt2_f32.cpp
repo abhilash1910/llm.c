@@ -766,7 +766,8 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 void matmul_forward_cublaslt(float* out,
                      float* inp, float* weight, float* bias,
                      int B, int T, int C, int OC, sycl::queue &q_ct1) {
-try{    
+try{  
+  
     int has_bias = (bias != NULL);
 
     // check bias alignment
@@ -789,12 +790,14 @@ try{
     //auto ctx = sycl::context(dev);
      
     dnnl::engine engine = sycl_interop::make_engine(dev, ctx);
-    // column major 
-    const memory::dims weight_strides = memory::dims {1, C};
+    // column major
+    const memory::dims weight_strides = memory::dims {1, OC};
     const auto weight_md = memory::desc({OC, C}, dt::f32, weight_strides);
-    const memory::dims input_strides = memory::dims {C, 1};
+    
+    const memory::dims input_strides = memory::dims {1, C};
     const auto input_md = memory::desc({C, B * T}, dt::f32, input_strides);
-    const memory::dims output_strides = memory::dims {OC, 1};
+    
+    const memory::dims output_strides = memory::dims {1, OC};
     const auto output_md =  memory::desc({OC, B * T}, dt::f32, output_strides);
     
     //memory align
@@ -811,6 +814,7 @@ try{
     
     
     auto matmul_pd = matmul::primitive_desc(engine, weight_md, input_md, output_md, attr);
+    
     auto matmul_prim = matmul(matmul_pd);
     std::unordered_map<int, memory> matmul_args;
     matmul_args.insert({DNNL_ARG_SRC, weight_mem});
@@ -820,8 +824,8 @@ try{
     
     matmul_prim.execute(stream, matmul_args);
     stream.wait();
-
-   
+    
+  
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -1886,8 +1890,17 @@ void error_usage() {
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
-
-    auto ekind = engine::kind::cpu;
+    
+    std::string ekind_;
+    
+    if (argc > 1) {
+       ekind_  = argv[1];
+    }
+    engine::kind ekind;
+    
+    if(ekind_ == "gpu"){
+        ekind = engine::kind::gpu;
+    }else{ ekind = engine::kind::cpu;}
         
     sycl::queue q = (ekind == engine::kind::gpu)
             ? sycl::queue(

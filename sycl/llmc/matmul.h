@@ -154,12 +154,15 @@ try{
      
     dnnl::engine engine = sycl_interop::make_engine(dev, ctx);
     // column major 
-    const memory::dims weight_strides = memory::dims {1, C};
+    const memory::dims weight_strides = memory::dims {1, OC};
     const auto weight_md = memory::desc({OC, C}, dt::f32, weight_strides);
-    const memory::dims input_strides = memory::dims {C, 1};
+    
+    const memory::dims input_strides = memory::dims {1, C};
     const auto input_md = memory::desc({C, B * T}, dt::f32, input_strides);
-    const memory::dims output_strides = memory::dims {OC, 1};
+    
+    const memory::dims output_strides = memory::dims {1, OC};
     const auto output_md =  memory::desc({OC, B * T}, dt::f32, output_strides);
+    
     
     //memory align
     memory weight_mem(weight_md, engine);

@@ -798,6 +798,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         
         model->cpu_losses_fp32 =
                 sycl::malloc_host<float>(B * T, q);
+        printf0("getting losses on cpu");
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -1531,7 +1532,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* load_filename = "gpt2_124M.bin"; // bf16 weights of the model
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
