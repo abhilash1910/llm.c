@@ -109,7 +109,7 @@ void lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
 }
 
 
-void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
+void attention_forward_dnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
                              int B, int T, int NH, int C,
@@ -170,7 +170,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
 
 }
 
-void attention_backward_cudnn(floatX* dqkvr,                                       // output
+void attention_backward_dnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
                               int B, int T, int NH, int C) {
     // to-do
@@ -211,7 +211,7 @@ int main(){
     q.memcpy(d_stats, stats, B * T * NH * C * sizeof(float)).wait();
     q.memcpy(d_out, out, B * T * NH * C * sizeof(float)).wait();
      
-    attention_forward_cudnn(d_out, d_stats, d_inp, B, T, NH, C, q, ekind);
+    attention_forward_dnn(d_out, d_stats, d_inp, B, T, NH, C, q, ekind);
     
 
   return 0;

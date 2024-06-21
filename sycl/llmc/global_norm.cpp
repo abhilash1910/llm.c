@@ -110,8 +110,6 @@ int main(int argc, char** argv) {
     validate_result(d_out, out, "out", 1, 1e-2f);
     
 
-    std::cout << "All results match. Starting benchmarks.\n\n";
-
 
     return 0;
 }

@@ -457,6 +457,12 @@ int main(){
     attention_forward(d_dout, d_qkvr, d_att,
                        d_dinp,
                        B, T, C, NH, q_ct1);
+                       
+    validate_result(d_dinp, dinp, "master_params_memory", B * T * 3*C * sizeof(float));
+    validate_result(d_qkvr, qkvr, "params_memory", B * T * 3*C * sizeof(float));
+    validate_result(d_att, att, "grads_memory", B * NH * T * T * sizeof(float));
+    validate_result(d_dout, dout, "m_memory", B * T * C * sizeof(float));
+    
     attention_backward(d_dinp, d_qkvr, d_preatt, d_att, d_scratch,
                          d_dout,
                         qkvr, att,

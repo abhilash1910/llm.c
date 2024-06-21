@@ -306,8 +306,78 @@ catch (sycl::exception const &exc) {
    
 }
 
+
+
 int main(){
 
+    dpct::device_ext &dev_ct1 = dpct::get_current_device();
+    sycl::queue &q_ct1 = dev_ct1.in_order_queue();
+    sycl::context ctx = q_ct1.get_context();
+    
+    int B = 8;
+    int T = 1024;
+    int C = 768;
+    size_t L = 2;
+    size_t NH = 4;
+    int OC = 768 * 4; // expansion of 4, e.g., in the MLP
+
+    // set up the device
+    std::cout << "Device: " << q_ct1.get_device().get_info<sycl::info::device::name>() << std::endl;
+
+     // create host memory of random numbers
+    float* dinp = make_zeros_float(B * T * C);
+    float* dweight = make_zeros_float(OC * C);
+    float* dbias = make_zeros_float(OC);
+    float* dout = make_random_float(B * T * OC);
+    float* inp = make_random_float(B * T * C);
+    float* weight = make_random_float(OC * C);
+    float* ones = make_zeros_float(OC);
+
+    // move to GPU
+    float* d_dinp = sycl::malloc_device<float>(B * T * C, q_ct1);
+    float* d_dweight = sycl::malloc_device<float>(OC * C, q_ct1);
+    float* d_dbias = sycl::malloc_device<float>(OC, q_ct1);
+    float* d_dout = sycl::malloc_device<float>(B * T * OC, q_ct1);
+    float* d_inp = sycl::malloc_device<float>(B * T * C, q_ct1);
+    float* d_weight = sycl::malloc_device<float>(OC * C, q_ct1);
+    float* d_ones = sycl::malloc_device<float>(OC, q_ct1);
+
+    q_ct1.memcpy(d_dinp, dinp, B * T * C * sizeof(float)).wait();
+    q_ct1.memcpy(d_dweight, dweight, OC * C * sizeof(float)).wait();
+    q_ct1.memcpy(d_dbias, dbias, OC * sizeof(float)).wait();
+    q_ct1.memcpy(d_dout, dout, B * T * OC * sizeof(float)).wait();
+    q_ct1.memcpy(d_inp, inp, B * T * C * sizeof(float)).wait();
+    q_ct1.memcpy(d_weight, weight, OC * C * sizeof(float)).wait();
+    q_ct1.memcpy(d_ones, ones, OC * sizeof(float)).wait();
+    std::cout<<"memcpy done"<<std::endl;
+    
+    matmul_forward_cublaslt(d_dout,
+                     d_dinp, d_dweight, d_dbias,
+                     B, T, C, OC, q_ct1);
+    validate_result(d_dinp, dinp, "inputs_memory", B * T *C * sizeof(float));
+    validate_result(d_dweight, dweight, "weights_memory", OC * C * sizeof(float));
+    validate_result(d_dbias, dbias, "bias_memory", OC * sizeof(float));
+    validate_result(d_dout, dout, "grads_memory", B * T * OC * sizeof(float));
+    
+    
+    matmul_backward(dinp, dweight, dbias,
+                    dout, inp, weight,
+                    dbias,
+                    B, T, C, OC, q_ct1);
+
+    validate_result(d_dinp, dinp, "inputs_memory", B * T *C * sizeof(float));
+    validate_result(d_dweight, dweight, "weights_memory", OC * C * sizeof(float));
+    validate_result(d_dbias, dbias, "bias_memory", OC * sizeof(float));
+    validate_result(d_dout, dout, "grads_memory", B * T * OC * sizeof(float));
+    
+    // Free device memory
+    sycl::free(d_dinp, q_ct1);
+    sycl::free(d_dweight, q_ct1);
+    sycl::free(d_dbias, q_ct1);
+    sycl::free(d_dout, q_ct1);
+    
+    // cleanup
+    
 
 
   return 0;

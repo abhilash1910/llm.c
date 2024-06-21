@@ -565,6 +565,7 @@ int main(int argc, char** argv) {
     float* inp = make_random_float(B * T * C);
     float* weight = make_random_float(C);
     float* bias = make_random_float(C);
+    float* scratch = make_random_float(C);
 
     // Device memory allocation
     float* d_out = sycl::malloc_device<float>(B * T * C, q);
@@ -573,11 +574,13 @@ int main(int argc, char** argv) {
     float* d_inp = sycl::malloc_device<float>(B * T * C, q);
     float* d_weight = sycl::malloc_device<float>(C, q);
     float* d_bias = sycl::malloc_device<float>(C, q);
+    float* d_scratch = sycl::malloc_device<float>(C, q);
 
     // Copy data to device
     q.memcpy(d_inp, inp, B * T * C * sizeof(float)).wait();
     q.memcpy(d_weight, weight, C * sizeof(float)).wait();
     q.memcpy(d_bias, bias, C * sizeof(float)).wait();
+    q.memcpy(d_scratch, scratch, C * sizeof(float)).wait();
 
     // read kernel_num from command line
 
@@ -588,9 +591,6 @@ int main(int argc, char** argv) {
     validate_result(d_rstd, rstd, "rstd", B * T, 1e-5f);
 
 
-    std::cout << "All results match. Starting benchmarks.\n\n";
-
-   
     // free memory
     free(out);
     free(mean);
