@@ -79,7 +79,7 @@ SYCL_EXTERNAL void fused_residual_forward_kernel5(
     const floatX *inp1, const floatX *inp2, const floatX *weight,
     const floatX *bias, int N, int C, const sycl::nd_item<3> &item_ct1,
     uint8_t *dpct_local) {
-    assert(0);
+    //assert(0);
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!

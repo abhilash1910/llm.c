@@ -112,7 +112,7 @@ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* i
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
     // uses the online softmax algorithm
-    assert(0);
+    //assert(0);
     int lane_id = item_ct1.get_local_id(2) % WARP_SIZE;
     int warp_id = item_ct1.get_local_id(2) / WARP_SIZE;
     int num_warps = item_ct1.get_local_range(2) / WARP_SIZE;

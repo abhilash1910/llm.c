@@ -97,7 +97,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    auto ekind = engine::kind::cpu;
+    auto ekind = engine::kind::gpu;
         
     sycl::queue q = (ekind == engine::kind::gpu)
             ? sycl::queue(

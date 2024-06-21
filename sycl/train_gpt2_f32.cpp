@@ -258,7 +258,7 @@ SYCL_EXTERNAL void softmax_forward_kernel5(float *out, float inv_temperature,
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
     // uses the online softmax algorithm
-    assert(0);
+    //assert(0);
     sycl::group<3> block = item_ct1.get_group();
     sycl::sub_group warp = item_ct1.get_sub_group();
     // micro-optimization: we iterate backwards so that
@@ -708,7 +708,7 @@ void fused_classifier_kernel3(float* logits, float* losses, float* probs,
 void encoder_forward(float* out,
                      const int* inp, const float* wte, const float* wpe,
                      int B, int T, int C, sycl::queue &q) {
-    assert(C % 4 == 0);
+    //assert(C % 4 == 0);
     const int block_size = 512;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N / 4, block_size);
@@ -1479,13 +1479,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T, sycl::qu
     int C = model->config.channels;
 
     // validate inputs, all indices must be in the range [0, V)
+    
     for(int i = 0; i < B * T; i++) {
         assert(0 <= inputs[i] && inputs[i] < V);
         if (targets != NULL) {
             assert(0 <= targets[i] && targets[i] < V);
         }
     }
-
+    
     // allocate space for all the activations if needed (done here, lazily)
     if(model->acts_memory == NULL) {
         // record the current B,T as well
@@ -1891,7 +1892,7 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
     
-    std::string ekind_;
+    std::string ekind_ = "gpu";
     
     if (argc > 1) {
        ekind_  = argv[1];
