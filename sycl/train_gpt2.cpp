@@ -466,6 +466,7 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n, sy
             acts_memory_iterator += act_sizes[i] * sizeof(floatX);
         }
     }
+    std::cout<<"acts_memory at add: "<<acts_memory<<std::endl;
     return acts_memory;
 }
 
@@ -751,7 +752,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
     // targets are optional and could be NULL
     // in this function we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
-
+    std::cout<<B<<std::endl;
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
@@ -776,6 +777,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
     // allocate space for all the activations if needed (done here, lazily)
     if(model->acts_memory == NULL) {
         // record the current B,T as well
+        std::cout<<B<<std::endl;
         model->batch_size = B;
         model->seq_len = T;
         // allocate the space
@@ -788,6 +790,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         printf0("allocating %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes, q);
         // also create memory for caching inputs and targets
+        std::cout<<"allocated"<<std::endl;
         model->inputs = sycl::malloc_device<int>(
                                        B * T, q);
         model->targets = sycl::malloc_device<int>(
@@ -798,7 +801,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         
         model->cpu_losses_fp32 =
                 sycl::malloc_host<float>(B * T, q);
-        printf0("getting losses on cpu");
+        std::cout<<"getting losses on cpu"<<std::endl;
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -817,6 +820,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
                 .wait();
     }
 
+     std::cout<<"Forward Encoder pass"<<std::endl;
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
@@ -877,7 +881,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, q);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C, q);
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, q);
-
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -895,28 +898,37 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
     }
 
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, q);
-
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         
         // fused classifier: does the forward pass and first part of the backward pass
         const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
+        std::cout<<"dloss :"<<dloss<<std::endl;
         fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, q);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         q.memcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX))
                 .wait();
         float mean_loss = 0.0f;
         for (int i = 0; i < B*T; i++) {
+            //std::cout<<B<<mean_loss<<model->cpu_losses[i]<<std::endl;
             float loss = (float)(model->cpu_losses[i]);
             model->cpu_losses_fp32[i] = loss;
             mean_loss += loss;
+            //std::cout<<mean_loss<<"loss_"<<std::endl;
+        
         }
+        
+        mean_loss = dloss;
         mean_loss /= B*T*grad_accum_steps;
         model->mean_loss = mean_loss;
+        std::cout<<"Loss mean||"<<mean_loss<<std::endl;
     } else {
         // if we don't have targets, we don't have loss
         model->mean_loss = -1.0f;
     }
+    std::cout<<"Loss mean"<<model->mean_loss<<std::endl;
+    std::cout<<"End of forward pass"<<std::endl;
+    
 }
 
 void gpt2_zero_grad(GPT2 *model, sycl::queue &q) {
@@ -924,6 +936,7 @@ void gpt2_zero_grad(GPT2 *model, sycl::queue &q) {
         q.memset(model->grads_memory, 0,model->num_parameters * sizeof(floatX))
                                  .wait();
     }
+    std::cout<<"set zero grad"<<std::endl;
 }
 
 void gpt2_backward(GPT2 *model, int* inputs, sycl::queue &q) {
@@ -932,7 +945,7 @@ void gpt2_backward(GPT2 *model, int* inputs, sycl::queue &q) {
         printf("Error: must forward with targets before backward\n");
         exit(EXIT_FAILURE);
     }
-
+    std::cout<<"allocating  MiB for parameter gradients\n"<<(int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024))<<std::endl;
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
@@ -987,7 +1000,10 @@ void gpt2_backward(GPT2 *model, int* inputs, sycl::queue &q) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
+    std::cout<<"Before backward matmul"<<std::endl;
     matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, q);
+    std::cout<<"After backward matmul"<<std::endl;
+    
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
@@ -1058,7 +1074,8 @@ void gpt2_backward(GPT2 *model, int* inputs, sycl::queue &q) {
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, q);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, q);
-
+        std::cout<<"After backward layernorm matmul"<<std::endl;
+    
         #ifdef ENABLE_DNN // dnn backward is not added
         float* l_att = (float*)acts.att + l * B * NH * T; // DNN needs a smaller FP32 tensor
         //attention_backward_dnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C); //to-do
@@ -1899,6 +1916,7 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps, q, ekind);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
+            printf0("Loss", lossf);
             gpt2_backward(&model, train_loader.inputs, q);
         }
         // override the mean loss, accounting for the gradient accumulation loop
