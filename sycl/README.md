@@ -35,11 +35,7 @@ Run them using:
 
 This will by default compile for spir64_gen runtime, more compiler customizations for spv will be followed.
 The corresponding header files for these cpp files contain same code which are used in llm.sycl frontend.
-We can manually target SPIRV like so:
 
-```bash
-export SPIRV=yes
-```
 
 ### Run for Nvidia sm architectures
 
