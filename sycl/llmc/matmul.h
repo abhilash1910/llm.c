@@ -32,8 +32,8 @@ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, in
                                              sycl::local_accessor<float, 3> sub_results) {
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
-    assert(0);
-    assert(0);
+    //assert(0);
+    //assert(0);
 
     int warp_d = (int)item_ct1.get_local_id(2);
     int warp_c = (int)item_ct1.get_local_id(1);
@@ -104,7 +104,7 @@ SYCL_EXTERNAL void reduce_add_sum_kernel(floatX *dst, const float *src,
     const size_t idx = (item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                         item_ct1.get_local_id(2)) *
                        f128::size;
-    assert(0);
+    //assert(0);
     if (idx < n) {
         f128 acc;
         for(int k = 0; k < f128::size; ++k) {
@@ -297,6 +297,14 @@ try{
         q, oneapi::mkl::transpose::nontrans,
         oneapi::mkl::transpose::trans, C, OC, B * T, &one, inp, CUBLAS_LOWP, C,
         dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, cublas_compute);
+     /*
+    oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+                            C, B * T, OC, &one, dweight, C, dout, OC, &zero, dinp, C).wait();
+    // backward to weight
+    oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
+                            C, OC, B * T, &one, inp, C, dout, OC, &zero, dweight, C).wait();
+    */
+
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__

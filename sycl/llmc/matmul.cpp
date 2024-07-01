@@ -19,8 +19,7 @@ Matrix Multiplication, with help from cuBLASLt
 #include <oneapi/dnnl/dnnl.hpp> 
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 #include <dpct/blas_utils.hpp>
-#include <oneapi/mkl.hpp>
-#include <oneapi/mkl/blas.hpp>
+
 // ----------------------------------------------------------------------------
 // SYCL kernels
 
@@ -33,8 +32,8 @@ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, in
                                              sycl::local_accessor<float, 3> sub_results) {
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
-    //assert(0);
-    //assert(0);
+    assert(0);
+    assert(0);
 
     int warp_d = (int)item_ct1.get_local_id(2);
     int warp_c = (int)item_ct1.get_local_id(1);
@@ -105,7 +104,7 @@ SYCL_EXTERNAL void reduce_add_sum_kernel(floatX *dst, const float *src,
     const size_t idx = (item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                         item_ct1.get_local_id(2)) *
                        f128::size;
-    //assert(0);
+    assert(0);
     if (idx < n) {
         f128 acc;
         for(int k = 0; k < f128::size; ++k) {
@@ -227,8 +226,7 @@ try{
         // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
         // and write results directly to the output.
         if(grid_size_y == 1) {
-            sycl::ext::oneapi::experimental::printf("here");
-
+            
             
             q.submit([&](sycl::handler &cgh) {
                 
@@ -252,8 +250,7 @@ try{
            
         } else {
             // kernel 9 overwrites temp buffer, so no need to memset
-            sycl::ext::oneapi::experimental::printf("here2");
-
+            
             q.submit([&](sycl::handler &cgh) {
                 
                 sycl::local_accessor<float, 3> sub_results_acc_ct1(
@@ -289,26 +286,16 @@ try{
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
-
-    dpct::gemm(q, oneapi::mkl::transpose::nontrans,
-                   oneapi::mkl::transpose::nontrans, C, B * T, OC, &one, dweight,
+    
+        dpct::gemm(q, oneapi::mkl::transpose::nontrans,
+                   oneapi::mkl::transpose::nontrans, C, B * T, OC, &one, weight,
                    CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero, dinp,
                    CUBLAS_LOWP, C, cublas_compute);
-    q.wait();
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
     dpct::gemm(
         q, oneapi::mkl::transpose::nontrans,
         oneapi::mkl::transpose::trans, C, OC, B * T, &one, inp, CUBLAS_LOWP, C,
-        dout, CUBLAS_LOWP, OC, &zero, dweight, CUBLAS_LOWP, C, cublas_compute);
-    q.wait();
-    
-    /*
-    oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
-                            C, B * T, OC, &one, dweight, C, dout, OC, &zero, dinp, C).wait();
-    // backward to weight
-    oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans,
-                            C, OC, B * T, &one, inp, C, dout, OC, &zero, dweight, C).wait();
-    */
+        dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, cublas_compute);
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -364,7 +351,6 @@ int main(){
     q_ct1.memcpy(d_ones, ones, OC * sizeof(float)).wait();
     std::cout<<"memcpy done"<<std::endl;
     
-    /*
     matmul_forward_cublaslt(d_dout,
                      d_dinp, d_dweight, d_dbias,
                      B, T, C, OC, q_ct1);
@@ -372,7 +358,7 @@ int main(){
     validate_result(d_dweight, dweight, "weights_memory", OC * C * sizeof(float));
     validate_result(d_dbias, dbias, "bias_memory", OC * sizeof(float));
     validate_result(d_dout, dout, "grads_memory", B * T * OC * sizeof(float));
-    */
+    
     
     matmul_backward(dinp, dweight, dbias,
                     dout, inp, weight,

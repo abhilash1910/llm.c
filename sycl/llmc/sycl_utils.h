@@ -346,6 +346,11 @@ float* make_zeros_floatX(size_t N) {
     return arr;
 }
 
+sycl::int4* make_zeros_syclint4(size_t N) {
+    sycl::int4* arr = (sycl::int4*)malloc(N * sizeof(sycl::int4));
+    memset(arr, 0, N * sizeof(sycl::int4)); // all zero
+    return arr;
+}
 
 
 

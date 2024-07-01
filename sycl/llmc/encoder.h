@@ -288,8 +288,9 @@ try{
                         dwte, d_bucket_info, d_workload_indices, dout, inp,
                         seed, B, T, C, item_ct1,
                         accum_shared_acc_ct1
-                            .get_multi_ptr<sycl::access::decorated::no>()
-                            .get());
+                            //.get_multi_ptr<sycl::access::decorated::no>()
+                            //.get()
+                            .get_pointer());
                 });
         });
     }

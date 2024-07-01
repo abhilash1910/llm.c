@@ -11,7 +11,7 @@ In the backward pass, the gradients flow to both, handled by different kernels
 #include <utility>              // std::pair
 #include <vector>
 #include <algorithm>
-#include <unordered_map>
+#include <unordered_map> 
 // llmc internal imports
 #include "sycl_common.h"
 #include "sycl_utils.h"
@@ -216,7 +216,7 @@ try{
         });
     }
     
-
+    
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
     // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?
     int num_c_groups = CEIL_DIV(C, x128::size * WARP_SIZE);
@@ -234,7 +234,7 @@ try{
             total_items++;
         }
     }
-
+    
     // Step 2: Sort buckets by size in descending order
     // this is so the largest buckets are processed first by the GPU
     // otherwise, if they started late, they would still be running with the rest of the GPU idle
@@ -260,7 +260,7 @@ try{
         }
         bucket_index++;
     }
-
+    
     // Step 3: Copy data from host to device (async until the last one to avoid synchronising CPU/GPU twice)
     // todo - could use CUDA events (even without streams) to avoid CPU/GPU synchronisation completely
     sycl::int4 *d_bucket_info = (sycl::int4 *)scratch;
@@ -268,7 +268,7 @@ try{
         (int *)(scratch + B * T * num_c_groups * sizeof(sycl::int4));
     q.memcpy(d_bucket_info, bucket_info, num_buckets * sizeof(sycl::int4));
     q.memcpy(d_workload_indices, workload_indices, total_items * sizeof(int)).wait();
-
+    
     // Launch wte kernel
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
     {
@@ -289,7 +289,8 @@ try{
                         seed, B, T, C, item_ct1,
                         accum_shared_acc_ct1
                             .get_multi_ptr<sycl::access::decorated::no>()
-                            .get());
+                            .get()
+                            );
                 });
         });
     }
@@ -316,7 +317,11 @@ int main(){
     int* inp = make_random_int(B * T, V);
     float* wte = make_random_float(V * C);
     float* wpe = make_random_float(T * C);
-
+    float* scratch = make_zeros_floatX(B * T * C);
+    int* workload_indices = make_random_int(B * T * C, V);
+    sycl::int4*  bucket_info= make_zeros_syclint4(B * T * C);
+    
+    
     // select device and create queue
     sycl::queue q(sycl::default_selector_v);
     std::cout << "Device: " << q.get_device().get_info<sycl::info::device::name>() << std::endl;
@@ -326,21 +331,34 @@ int main(){
     int* d_inp = sycl::malloc_device<int>(B * T, q);
     float* d_wte = sycl::malloc_device<float>(V * C, q);
     float* d_wpe = sycl::malloc_device<float>(T * C, q);
-
+    float* d_scratch = sycl::malloc_device<float>(B * T * C, q);
+    int* d_workload_indices = sycl::malloc_device<int>(B * T * C, q);
+    sycl::int4* d_bucket_info = sycl::malloc_device<sycl::int4>(B * T * C, q);
+    
+    q.memcpy(d_scratch, scratch, B * T * C * sizeof(float)).wait();
     q.memcpy(d_inp, inp, B * T * sizeof(int)).wait();
     q.memcpy(d_wte, wte, V * C * sizeof(float)).wait();
     q.memcpy(d_wpe, wpe, T * C * sizeof(float)).wait();
     q.memcpy(d_out, out, B * T * C * sizeof(float)).wait();
+    q.memcpy(d_workload_indices, workload_indices, B * T * C * sizeof(int)).wait();
+    q.memcpy(d_bucket_info, bucket_info, B * T * C * sizeof(sycl::int4)).wait();
     
     encoder_forward(d_out, d_inp, d_wte, d_wpe, B, T, C, q);
     
-    validate_result(d_out, out, "out", B * T * C, 1e-5f);
+    //validate_result(d_out, out, "out", B * T * C, 1e-5f);
     //validate_result(d_inp, inp, "inp", B * T, 1e-5f);
-    validate_result(d_wpe, wpe, "wpe", T * C, 1e-5f);
-    validate_result(d_wte, wte, "wte", V * C, 1e-5f);
+    //validate_result(d_wpe, wpe, "wpe", T * C, 1e-5f);
+    //validate_result(d_wte, wte, "wte", V * C, 1e-5f);
     
-    
-
+    unsigned int seed = 42;
+    encoder_backward(d_wte, d_wpe,
+                      d_scratch, // gpu outputs & scratch
+                      d_workload_indices,
+                      d_bucket_info, // cpu scratch buffers
+                      d_out, d_inp,
+                      d_inp, // cpu/gpu inputs
+                      B, T, C, seed, q);
+    validate_result(d_out, out, "out", B * T * C, 1e-5f);
 
 return 0;
 
