@@ -288,15 +288,17 @@ try{
 
     // backward to input, uses = in the backward pass (set the gradient)
     
-        dpct::gemm(q, oneapi::mkl::transpose::nontrans,
+    dpct::gemm(q, oneapi::mkl::transpose::nontrans,
                    oneapi::mkl::transpose::nontrans, C, B * T, OC, &one, weight,
                    CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero, dinp,
                    CUBLAS_LOWP, C, cublas_compute);
+    q.wait();
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
     dpct::gemm(
         q, oneapi::mkl::transpose::nontrans,
         oneapi::mkl::transpose::trans, C, OC, B * T, &one, inp, CUBLAS_LOWP, C,
         dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, cublas_compute);
+    q.wait();
      /*
     oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
                             C, B * T, OC, &one, dweight, C, dout, OC, &zero, dinp, C).wait();

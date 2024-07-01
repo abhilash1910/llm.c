@@ -287,15 +287,17 @@ try{
 
     // backward to input, uses = in the backward pass (set the gradient)
     
-        dpct::gemm(q, oneapi::mkl::transpose::nontrans,
+    dpct::gemm(q, oneapi::mkl::transpose::nontrans,
                    oneapi::mkl::transpose::nontrans, C, B * T, OC, &one, weight,
                    CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero, dinp,
                    CUBLAS_LOWP, C, cublas_compute);
+    q.wait();
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
     dpct::gemm(
         q, oneapi::mkl::transpose::nontrans,
         oneapi::mkl::transpose::trans, C, OC, B * T, &one, inp, CUBLAS_LOWP, C,
         dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, cublas_compute);
+    q.wait();
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
